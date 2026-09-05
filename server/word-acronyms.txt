@@ -1,0 +1,4 @@
+# Acronyms/initialisms that are pronounced as a word, not spelled out
+# letter-by-letter. One per line, case-insensitive, '#' comments allowed.
+# The defaults baked into acronyms.py (NASA, OK, COVID, ...) don't need to
+# be repeated here - add ones you notice being read wrong in real digests.

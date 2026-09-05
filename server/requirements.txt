@@ -1,0 +1,19 @@
+# Core server - always needed.
+fastapi
+uvicorn[standard]
+
+# Kokoro TTS engine - lightweight, CPU-only, no GPU required. This is the
+# default/recommended engine to start with.
+kokoro-onnx
+soundfile
+
+# Chatterbox TTS engine - optional. Heavier (needs a CUDA GPU with a few
+# GB of free VRAM) and more natural-sounding. If you skip installing this,
+# the server still runs fine with Kokoro alone - Chatterbox's /status
+# entry will just stay "loading" forever and requests routed to it will
+# fail, Kokoro is unaffected either way.
+# chatterbox-tts
+
+# resemble-perth (a chatterbox-tts dependency) still uses the removed
+# pkg_resources API - only needed if you install chatterbox-tts above.
+# setuptools<81

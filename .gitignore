@@ -1,0 +1,4 @@
+build/
+debug.keystore
+server/__pycache__/
+server/*.pyc
