@@ -1,11 +1,14 @@
 package dev.local.rssreader
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import android.view.Gravity
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
@@ -38,28 +41,61 @@ class MainActivity : Activity() {
     private lateinit var listView: ListView
     private lateinit var statusView: TextView
     private var entries: List<FeedEntry> = emptyList()
+    // Only auto-open Settings once, on the very first launch - not on every
+    // resume. Resuming after backing out of Settings without configuring
+    // anything must NOT relaunch it, or Back becomes a trap that always
+    // bounces straight back to an unconfigured Settings screen.
+    private var autoOpenedSettings = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
+        }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Theme.bg)
+        }
 
         statusView = TextView(this).apply {
             text = "Loading..."
-            setPadding(40, 40, 40, 40)
+            textSize = 14f
+            setTextColor(Theme.onSurfaceVariant)
+            setPadding(Theme.dp(this@MainActivity, 20), Theme.dp(this@MainActivity, 20), Theme.dp(this@MainActivity, 20), Theme.dp(this@MainActivity, 20))
         }
         root.addView(statusView)
 
-        listView = ListView(this)
+        listView = ListView(this).apply {
+            divider = ColorDrawable(Theme.outlineVariant)
+            dividerHeight = 1
+            setBackgroundColor(Theme.bg)
+            setSelector(android.R.color.transparent)
+        }
         root.addView(listView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
+
+        if (!Settings.isConfigured(this)) {
+            autoOpenedSettings = true
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
     }
 
     override fun onResume() {
         super.onResume()
         if (!Settings.isConfigured(this)) {
-            startActivity(Intent(this, SettingsActivity::class.java))
+            if (!autoOpenedSettings) {
+                autoOpenedSettings = true
+                startActivity(Intent(this, SettingsActivity::class.java))
+                return
+            }
+            statusView.visibility = View.VISIBLE
+            statusView.text = "Not configured yet - use the menu (top right) to open settings."
+            listView.adapter = null
             return
         }
         if (entries.isEmpty()) load()
@@ -79,18 +115,25 @@ class MainActivity : Activity() {
     }
 
     private fun load() {
+        statusView.visibility = View.VISIBLE
         statusView.text = "Loading..."
         Thread {
             try {
                 val result = fetchEntries()
                 runOnUiThread {
                     entries = result
-                    statusView.text = if (result.isEmpty()) "No feed data yet" else ""
+                    if (result.isEmpty()) {
+                        statusView.visibility = View.VISIBLE
+                        statusView.text = "No feed data yet"
+                    } else {
+                        statusView.visibility = View.GONE // no dead space above a populated list
+                    }
                     listView.adapter = EntryAdapter()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "load failed", e)
                 runOnUiThread {
+                    statusView.visibility = View.VISIBLE
                     statusView.text = "Failed to load: ${e.message}"
                     Toast.makeText(this, "Load failed - check WireGuard connection", Toast.LENGTH_LONG).show()
                 }
@@ -102,7 +145,7 @@ class MainActivity : Activity() {
         val out = mutableListOf<FeedEntry>()
 
         try {
-            val digestJson = JSONObject(ApiClient.ttsGet(this, "/feed/digest"))
+            val digestJson = JSONObject(ApiClient.get(this, "/feed/digest"))
             out.add(FeedEntry.Digest(
                 date = digestJson.getString("date"),
                 markdown = digestJson.getString("markdown"),
@@ -112,7 +155,7 @@ class MainActivity : Activity() {
             if (e.code != 404) throw e // 404 just means no digest generated yet - fine
         }
 
-        val itemsJson = JSONObject(ApiClient.ttsGet(this, "/feed/items?limit=50"))
+        val itemsJson = JSONObject(ApiClient.get(this, "/feed/items?limit=50"))
         val itemsArray = itemsJson.getJSONArray("items")
         for (i in 0 until itemsArray.length()) {
             val it = itemsArray.getJSONObject(i)
@@ -161,36 +204,53 @@ class MainActivity : Activity() {
             val entry = entries[position]
             val container = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(40, 30, 40, 30)
+                val padH = Theme.dp(this@MainActivity, 20)
+                val padV = Theme.dp(this@MainActivity, 16)
+                setPadding(padH, padV, padH, padV)
+                background = Theme.rippleOn(Theme.roundedDrawable(Theme.bg, this@MainActivity, radiusDp = 0))
             }
 
+            val badge = TextView(this@MainActivity).apply {
+                textSize = 10f
+                setTextColor(Theme.onPrimary)
+                setPadding(Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2), Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2))
+            }
             val title = TextView(this@MainActivity).apply {
                 textSize = 16f
                 setTypeface(null, Typeface.BOLD)
+                setTextColor(Theme.onBackground)
+                setPadding(0, Theme.dp(this@MainActivity, 6), 0, 0)
             }
             val subtitle = TextView(this@MainActivity).apply {
                 textSize = 12f
-                setTextColor(0xFF888888.toInt())
-                setPadding(0, 6, 0, 6)
+                setTextColor(Theme.muted)
+                setPadding(0, Theme.dp(this@MainActivity, 4), 0, Theme.dp(this@MainActivity, 6))
             }
             val snippet = TextView(this@MainActivity).apply {
                 textSize = 14f
+                setTextColor(Theme.onSurfaceVariant)
                 maxLines = 2
             }
 
             when (entry) {
                 is FeedEntry.Digest -> {
+                    badge.text = "DIGEST"
+                    badge.background = Theme.roundedDrawable(Theme.primary, this@MainActivity, radiusDp = 4)
                     title.text = "Today's digest"
                     subtitle.text = entry.date
                     snippet.text = entry.markdown.take(140).replace("\n", " ")
                 }
                 is FeedEntry.Item -> {
+                    badge.text = "ARTICLE"
+                    badge.background = Theme.roundedDrawable(Theme.surfaceContainer, this@MainActivity, radiusDp = 4)
+                    badge.setTextColor(Theme.onSurfaceVariant)
                     title.text = entry.title
                     subtitle.text = "${entry.feedTitle} · ${entry.published.take(10)}"
                     snippet.text = entry.summary
                 }
             }
 
+            container.addView(badge, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             container.addView(title)
             container.addView(subtitle)
             container.addView(snippet)

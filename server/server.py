@@ -24,12 +24,15 @@ engine's real output duration, not a forced alignment - good enough for a
 reading-highlight UI without adding a whole alignment model on the
 responsiveness-critical path.
 """
+import asyncio
 import ipaddress
+import json
 import os
 import re
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -41,6 +44,13 @@ from starlette.responses import FileResponse, JSONResponse
 import feed
 from acronyms import expand_acronyms
 from text_clean import markdown_to_speech
+
+CLAUDE_BIN = str(Path.home() / ".local" / "bin" / "claude")
+ACCOUNT_DIRS = {
+    "claude": Path.home() / ".claude",
+    "claude2": Path.home() / ".claude2",
+    "claude3": Path.home() / ".claude3",
+}
 
 
 def _env_or_fatal(name):
@@ -141,6 +151,39 @@ def estimate_word_timings(sentence: str, duration_s: float) -> list[dict]:
 def float_to_pcm16(samples: np.ndarray) -> bytes:
     clipped = np.clip(samples, -1.0, 1.0)
     return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
+class SentenceBuffer:
+    """Accumulates raw streamed text and yields complete sentences as soon
+    as a sentence-ending boundary is seen, so the caller can start
+    synthesizing sentence N while sentence N+1 is still being generated.
+    Operates on raw (not yet markdown-stripped) text - a period inside a
+    URL or code span can occasionally trigger an early split, accepted as
+    a rare cosmetic edge case in exchange for not having to buffer the
+    entire reply before any audio can start."""
+
+    _BOUNDARY_RE = re.compile(r"[.!?][\"')\]]*\s+")
+
+    def __init__(self):
+        self.buf = ""
+
+    def add(self, delta: str) -> list[str]:
+        self.buf += delta
+        out = []
+        while True:
+            m = self._BOUNDARY_RE.search(self.buf)
+            if not m:
+                break
+            sentence = self.buf[: m.end()].strip()
+            self.buf = self.buf[m.end():]
+            if sentence:
+                out.append(sentence)
+        return out
+
+    def flush(self) -> str | None:
+        remaining = self.buf.strip()
+        self.buf = ""
+        return remaining or None
 
 
 # --------------------------------------------------------------- engines
@@ -283,24 +326,177 @@ async def tts_stream(websocket: WebSocket):
             return
 
         cleaned = markdown_to_speech(text)
-        expanded = expand_acronyms(cleaned)
-        sentences = split_sentences(expanded)
+        # Sentences are split from the pre-acronym-expansion text, and that
+        # is what gets returned in "text"/"words" too - expansion ("RCE" ->
+        # "R C E") only happens right before synthesis, inside
+        # synthesize_and_send(). Otherwise a client highlighting words
+        # against its own normally-rendered display would see "R", "C", "E"
+        # as three separate timed words instead of the one word "RCE" it
+        # actually shows on screen - confirmed this mismatch live before
+        # splitting sentences off the expanded text was fixed here.
+        sentences = split_sentences(cleaned)
 
         for sentence in sentences:
-            t0 = time.monotonic()
-            samples, sr = await run_in_threadpool(engine.synthesize, sentence, voice)
-            duration_s = len(samples) / sr
-            await websocket.send_json({
-                "type": "sentence",
-                "text": sentence,
-                "sample_rate": sr,
-                "duration_ms": round(duration_s * 1000),
-                "synth_ms": round((time.monotonic() - t0) * 1000),
-                "words": estimate_word_timings(sentence, duration_s),
-            })
-            await websocket.send_bytes(float_to_pcm16(samples))
+            await synthesize_and_send(websocket, engine, sentence, voice)
 
         await websocket.send_json({"type": "done"})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "message": f"{e.__class__.__name__}: {e}"})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+async def synthesize_and_send(websocket: WebSocket, engine, sentence: str, voice: str | None):
+    """sentence is exactly what the client will display and highlight -
+    acronym expansion happens only in the copy handed to the engine, never
+    reaching the client, so word timings always line up with what's shown
+    on screen (see the comment above tts_stream's sentence loop)."""
+    expanded = expand_acronyms(sentence)
+    t0 = time.monotonic()
+    samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
+    duration_s = len(samples) / sr
+    await websocket.send_json({
+        "type": "sentence",
+        "text": sentence,
+        "sample_rate": sr,
+        "duration_ms": round(duration_s * 1000),
+        "synth_ms": round((time.monotonic() - t0) * 1000),
+        "words": estimate_word_timings(sentence, duration_s),
+    })
+    await websocket.send_bytes(float_to_pcm16(samples))
+
+
+@app.websocket("/agent/chat")
+async def agent_chat(websocket: WebSocket):
+    """Drives claude --print --output-format stream-json
+    --include-partial-messages directly as a subprocess per turn - no tmux,
+    no transcript-file polling. Confirmed live (2026-09-05) that the JSONL
+    transcript claude-relay/claude-agents reads for *interactive* sessions
+    only gets new lines in bursts (a several-second gap, then ~10 lines at
+    once), not incrementally during generation - fine for reading a
+    finished reply, useless for starting TTS before the reply is done.
+    --include-partial-messages gives real token-level text_delta events on
+    this process's own stdout instead, which is what actually lets audio
+    start on sentence 1 while the model is still generating sentence 4.
+
+    One `claude --print` subprocess per turn (not one long-lived process
+    for the whole conversation) - --session-id on the first turn and
+    --resume on every follow-up is what lets this be stateless between
+    turns while still being one continuous conversation server-side.
+    """
+    client_host = websocket.client.host if websocket.client else None
+    if not _security_ok(client_host, websocket.headers):
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+
+    session_id: str | None = None
+    try:
+        while True:
+            req = await websocket.receive_json()
+            cmd = req.get("cmd")
+            text = (req.get("text") or "").strip()
+            engine_name = req.get("engine", "kokoro")
+            voice = req.get("voice")
+            account = req.get("account", "claude2")
+
+            if not text:
+                await websocket.send_json({"type": "error", "message": "empty text"})
+                continue
+            engine = ENGINES.get(engine_name)
+            if engine is None or not engine.ready:
+                await websocket.send_json({"type": "error", "message": f"'{engine_name}' not available"})
+                continue
+            if account not in ACCOUNT_DIRS:
+                await websocket.send_json({"type": "error", "message": f"unknown account '{account}'"})
+                continue
+
+            if cmd == "start":
+                session_id = str(uuid.uuid4())
+                argv = [
+                    CLAUDE_BIN, "--print", "--output-format", "stream-json", "--verbose",
+                    "--include-partial-messages", "--dangerously-skip-permissions",
+                    "--session-id", session_id, text,
+                ]
+            elif cmd == "continue":
+                session_id = req.get("session_id") or session_id
+                if not session_id:
+                    await websocket.send_json({"type": "error", "message": "no active session - send cmd 'start' first"})
+                    continue
+                argv = [
+                    CLAUDE_BIN, "--print", "--output-format", "stream-json", "--verbose",
+                    "--include-partial-messages", "--dangerously-skip-permissions",
+                    "--resume", session_id, text,
+                ]
+            else:
+                await websocket.send_json({"type": "error", "message": f"unknown cmd '{cmd}'"})
+                continue
+
+            await websocket.send_json({"type": "session", "session_id": session_id})
+
+            env = os.environ.copy()
+            env["CLAUDE_CONFIG_DIR"] = str(ACCOUNT_DIRS[account])
+
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(Path.home()),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            buf = SentenceBuffer()
+            saw_any_event = False
+            try:
+                async for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    saw_any_event = True
+                    etype = event.get("type")
+                    if etype == "stream_event":
+                        inner = event.get("event", {})
+                        if inner.get("type") == "content_block_delta":
+                            delta = inner.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                piece = delta.get("text", "")
+                                if piece:
+                                    await websocket.send_json({"type": "text_delta", "text": piece})
+                                    for raw_sentence in buf.add(piece):
+                                        cleaned_sentence = markdown_to_speech(raw_sentence).strip()
+                                        if cleaned_sentence:
+                                            await synthesize_and_send(websocket, engine, cleaned_sentence, voice)
+                    elif etype == "result" and event.get("is_error"):
+                        await websocket.send_json({"type": "error", "message": str(event.get("result", "agent error"))})
+
+                await proc.wait()
+
+                if not saw_any_event and proc.returncode != 0:
+                    stderr = (await proc.stderr.read()).decode("utf-8", "replace")[:2000]
+                    await websocket.send_json({"type": "error", "message": f"claude exited {proc.returncode}: {stderr}"})
+
+                remaining = buf.flush()
+                if remaining:
+                    cleaned_remaining = markdown_to_speech(remaining).strip()
+                    if cleaned_remaining:
+                        await synthesize_and_send(websocket, engine, cleaned_remaining, voice)
+
+                await websocket.send_json({"type": "turn_done", "session_id": session_id})
+            finally:
+                if proc.returncode is None:
+                    proc.kill()
     except WebSocketDisconnect:
         pass
     except Exception as e:
