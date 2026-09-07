@@ -1,4 +1,4 @@
-package dev.local.rssreader
+package dev.local.newsdigest
 
 import android.content.Context
 import android.graphics.Color

@@ -1,0 +1,22 @@
+[Unit]
+Description=News Digest feed + TTS + agent-chat server (Kokoro + Chatterbox)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=HF_HOME=%h/.cache/newsdigest-server/hf
+# Replace with your own tunnel address and subnet - the server refuses to
+# start without both. See ../README.md.
+Environment=NEWSDIGEST_BIND_HOST=10.0.0.1
+Environment=NEWSDIGEST_ALLOWED_SUBNET=10.0.0.0/24
+# Point these at wherever you actually cloned this repo - running the
+# server straight out of the repo (rather than a separately-maintained
+# copy) means `git pull` is the only update step, nothing to keep in sync.
+WorkingDirectory=/path/to/newsdigest-android/server
+# The venv can live wherever you like; only its interpreter path matters.
+ExecStart=%h/.venvs/newsdigest-server/bin/python3 server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

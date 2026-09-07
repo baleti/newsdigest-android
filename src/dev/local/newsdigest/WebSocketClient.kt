@@ -1,4 +1,4 @@
-package dev.local.rssreader
+package dev.local.newsdigest
 
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream

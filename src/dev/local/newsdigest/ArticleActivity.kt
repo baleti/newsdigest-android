@@ -1,4 +1,4 @@
-package dev.local.rssreader
+package dev.local.newsdigest
 
 import android.app.Activity
 import android.os.Bundle
@@ -106,7 +106,7 @@ class ArticleActivity : Activity() {
                     root.addView(contentView)
                 }
             } catch (e: Exception) {
-                Log.e("RssReader", "article load failed", e)
+                Log.e("NewsDigest", "article load failed", e)
                 runOnUiThread { statusView.text = "Failed to load article: ${e.message}" }
             }
         }.start()

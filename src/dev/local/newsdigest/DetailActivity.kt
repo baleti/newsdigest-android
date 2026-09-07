@@ -1,4 +1,4 @@
-package dev.local.rssreader
+package dev.local.newsdigest
 
 import android.app.Activity
 import android.content.ComponentName

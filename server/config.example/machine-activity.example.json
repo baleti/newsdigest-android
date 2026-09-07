@@ -1,0 +1,4 @@
+{
+  "repos": ["/home/you/src/some-project", "/home/you/src/another-project"],
+  "systemd_units": ["some-timer.service"]
+}

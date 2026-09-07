@@ -1,18 +1,34 @@
 """
-Read-only feed data for the RSS reader app: rssd's item archive, cached
-favicons, and the daily digest built by rss-digest.sh / build-digest-json.py.
-Kept separate from server.py's TTS/security plumbing so this module has no
+Read-only feed data for the News Digest app: merges whatever activity
+sources a local, untracked config points it at (RSS, git activity, a
+bot's own posts, calendar, email headers, ...) into one item list, plus
+cached RSS favicons and the daily digest built by a local (also
+untracked - see README's "Digest generation") generator script. Kept
+separate from server.py's TTS/security plumbing so this module has no
 FastAPI dependency of its own - server.py wires it into routes.
+
+Every source is just a JSONL file in the shared item schema (see
+README's "Sources" section) - this module doesn't know or care which
+collector produced a given line, so adding a new source is purely a
+config change, never a code change here.
 """
 import json
+import os
 import re
 from pathlib import Path
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 
-ITEMS_FILE = Path.home() / ".cache" / "rssd" / "items.jsonl"
+# Back-compat default when no sources.json exists yet: just the one RSS
+# archive this project originally read, so an existing deployment that
+# hasn't set up the new config keeps working unchanged.
+_DEFAULT_SOURCES = [{"name": "rss", "items_file": str(Path.home() / ".cache" / "rssd" / "items.jsonl")}]
+
+SOURCES_CONFIG = Path(
+    os.environ.get("NEWSDIGEST_SOURCES_CONFIG", str(Path.home() / ".config" / "newsdigest" / "sources.json")),
+)
 ICONS_DIR = Path.home() / ".cache" / "rssd" / "icons"
-DIGEST_DIR = Path.home() / ".cache" / "tts-server" / "digest"
+DIGEST_DIR = Path.home() / ".cache" / "newsdigest-server" / "digest"
 
 _EXT_TO_MIME = {
     ".png": "image/png",
@@ -23,16 +39,28 @@ _EXT_TO_MIME = {
 }
 
 
+def _enabled_sources() -> list[dict]:
+    if not SOURCES_CONFIG.exists():
+        return _DEFAULT_SOURCES
+    try:
+        config = json.loads(SOURCES_CONFIG.read_text())
+    except Exception:
+        return _DEFAULT_SOURCES
+    return [s for s in config.get("sources", []) if s.get("enabled", True)]
+
+
 def _load_items() -> list[dict]:
     items = []
-    if not ITEMS_FILE.exists():
-        return items
-    with open(ITEMS_FILE, "r", errors="ignore") as f:
-        for line in f:
-            try:
-                items.append(json.loads(line))
-            except Exception:
-                continue
+    for source in _enabled_sources():
+        items_file = Path(source["items_file"]).expanduser()
+        if not items_file.exists():
+            continue
+        with open(items_file, "r", errors="ignore") as f:
+            for line in f:
+                try:
+                    items.append(json.loads(line))
+                except Exception:
+                    continue
     return items
 
 

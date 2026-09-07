@@ -1,4 +1,4 @@
-package dev.local.rssreader
+package dev.local.newsdigest
 
 import android.Manifest
 import android.app.Activity
@@ -22,7 +22,7 @@ import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
 
-private const val TAG = "RssReader"
+private const val TAG = "NewsDigest"
 
 sealed class FeedEntry {
     data class Digest(val date: String, val markdown: String, val references: JSONArray) : FeedEntry()

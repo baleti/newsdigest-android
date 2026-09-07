@@ -2,7 +2,7 @@
 TTS + feed server for the RSS reader app. Runs both TTS engines resident
 in one process (Kokoro on CPU via onnxruntime, Chatterbox on GPU via CUDA)
 so the app can pick either from a settings toggle. WireGuard-only: bound
-directly to the tunnel interface address (RSS_READER_BIND_HOST), not
+directly to the tunnel interface address (NEWSDIGEST_BIND_HOST), not
 0.0.0.0 - unlike the phone's Companion app, a Linux host CAN bind to its
 own tunnel interface, so off-tunnel traffic never reaches this socket at
 the kernel level at all. The X-Peer-Agent header + Origin rejection below
@@ -56,15 +56,15 @@ ACCOUNT_DIRS = {
 def _env_or_fatal(name):
     val = os.environ.get(name)
     if not val:
-        sys.stderr.write(f"tts-server: {name} must be set (see README) - refusing to start\n")
+        sys.stderr.write(f"newsdigest-server: {name} must be set (see README) - refusing to start\n")
         raise SystemExit(1)
     return val
 
 
-BIND_HOST = _env_or_fatal("RSS_READER_BIND_HOST")
-BIND_PORT = int(os.environ.get("RSS_READER_BIND_PORT", "8792"))
-ALLOWED_SUBNET = ipaddress.ip_network(_env_or_fatal("RSS_READER_ALLOWED_SUBNET"))
-MODEL_DIR = Path.home() / ".cache" / "tts-server"
+BIND_HOST = _env_or_fatal("NEWSDIGEST_BIND_HOST")
+BIND_PORT = int(os.environ.get("NEWSDIGEST_BIND_PORT", "8792"))
+ALLOWED_SUBNET = ipaddress.ip_network(_env_or_fatal("NEWSDIGEST_ALLOWED_SUBNET"))
+MODEL_DIR = Path.home() / ".cache" / "newsdigest-server"
 
 
 @asynccontextmanager
@@ -248,7 +248,7 @@ def _load_engine_background(engine):
     try:
         engine.load()
     except Exception as e:
-        print(f"[tts-server] {engine.name} failed to load: {e.__class__.__name__}: {e}")
+        print(f"[newsdigest-server] {engine.name} failed to load: {e.__class__.__name__}: {e}")
 
 
 # ------------------------------------------------------------------ HTTP

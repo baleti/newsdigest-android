@@ -1,0 +1,4 @@
+{
+  "watch_notifications": true,
+  "repos": ["yourname/some-repo"]
+}

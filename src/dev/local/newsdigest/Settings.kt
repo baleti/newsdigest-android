@@ -1,4 +1,4 @@
-package dev.local.rssreader
+package dev.local.newsdigest
 
 import android.content.Context
 
@@ -12,7 +12,7 @@ import android.content.Context
  * non-secret header (see server.py's docstring), not a credential.
  */
 object Settings {
-    private const val PREFS = "rssreader_prefs"
+    private const val PREFS = "newsdigest_prefs"
 
     const val DEFAULT_TTS_PORT = 8792
     const val DEFAULT_ENGINE = "kokoro"

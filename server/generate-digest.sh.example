@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Generates a daily digest via an LLM and writes it (plus an extracted
+# references list) to ~/.cache/newsdigest-server/digest/ for the app to
+# pull from /feed/digest.
+#
+# This is an EXAMPLE - copy it outside the repo (it's not meant to be run
+# as-is) and fill in the marked section with your own personalization.
+# A good digest should know who you are and what you actually care about
+# to pick out what's worth mentioning; that's inherently personal, so it
+# doesn't belong in a public repo even as a real working default.
+set -euo pipefail
+cd "$(dirname "$0")"  # so `python3 -c 'import feed'` below resolves feed.py
+
+SOURCE_FILES=$(python3 -c "
+import feed
+paths = sorted({s['items_file'] for s in feed._enabled_sources()})
+print('\n'.join(paths))
+")
+
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+claude --dangerously-skip-permissions -p "$(cat <<PROMPT
+Read today's new activity from these JSONL files (one JSON object per
+line; fields include title, summary, feed_title, tags, link, published):
+
+$SOURCE_FILES
+
+Filter to items published or fetched in roughly the last 24 hours.
+
+# --- fill in your own personalization here ---
+# e.g. "skim ~/notes/about-me.md for context on who I am and what I
+# actually care about" - whatever tells the model which of today's items
+# are actually worth your time, and how they connect to what you're
+# working on.
+
+Write today's digest as a short piece of narrative writing - like an
+entry in a personal newsletter written directly to you, not a bulleted
+report. Pick out the handful of items that are genuinely most
+interesting across ALL the sources above, not just one - a quiet news
+day with an interesting commit or calendar clash is still worth a
+sentence. Let one item flow into the next with real transitions, the way
+someone telling you about their day would, rather than restarting
+structure for each one. A handful of paragraphs, a few hundred words.
+
+Every story or item you mention by name must carry a markdown link
+[label](url) to its original link field, when it has one - never mention
+a linkable item without linking it, and never invent a URL that isn't in
+the source files. Also name where each item is FROM in the prose itself,
+using its feed_title field - not only via the link - since someone
+reading this aloud through text-to-speech never sees a URL or its domain.
+
+Output ONLY the finished piece - no preamble, no meta-commentary, no
+"here is the digest". Your entire response is saved verbatim as today's
+digest file.
+PROMPT
+)" > "$TMP"
+
+if [ ! -s "$TMP" ]; then
+    echo "generate-digest: claude produced no output, not writing" >&2
+    exit 1
+fi
+
+python3 build_digest_json.py < "$TMP"

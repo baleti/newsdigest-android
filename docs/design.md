@@ -54,11 +54,11 @@ otherwise confuse sentence splitting.
 
 Mirrors the same pattern used across this whole family of tools: the
 server binds directly to the tunnel interface address
-(`RSS_READER_BIND_HOST`), not `0.0.0.0` - a Linux host can bind to its own
+(`NEWSDIGEST_BIND_HOST`), not `0.0.0.0` - a Linux host can bind to its own
 tunnel interface (unlike an Android app, which can't enumerate or bind a
 VPN's tun interface at all), so off-tunnel traffic never reaches the
 socket at the kernel level. On top of that: a source-IP check against
-`RSS_READER_ALLOWED_SUBNET` (defense in depth, since the bind address
+`NEWSDIGEST_ALLOWED_SUBNET` (defense in depth, since the bind address
 already limits reachability), a required `X-Peer-Agent: 1` header, and
 outright rejection of any request carrying an `Origin` header. That last
 pair defends against a browser on another peer's device being tricked

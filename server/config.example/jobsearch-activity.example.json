@@ -1,0 +1,5 @@
+{
+  "pipeline_state_dir": "/home/you/.local/share/some-job-search-pipeline/state",
+  "enable_browser_check": false,
+  "cdp_port": 9223
+}

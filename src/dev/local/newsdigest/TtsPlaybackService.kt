@@ -1,4 +1,4 @@
-package dev.local.rssreader
+package dev.local.newsdigest
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -72,9 +72,9 @@ class TtsPlaybackService : Service() {
         const val CHANNEL_ID = "tts_playback"
         const val NOTIF_ID = 2
         private const val HIGHLIGHT_TICK_MS = 60L
-        private const val ACTION_PLAY = "dev.local.rssreader.action.PLAY"
-        private const val ACTION_PAUSE = "dev.local.rssreader.action.PAUSE"
-        private const val ACTION_STOP = "dev.local.rssreader.action.STOP"
+        private const val ACTION_PLAY = "dev.local.newsdigest.action.PLAY"
+        private const val ACTION_PAUSE = "dev.local.newsdigest.action.PAUSE"
+        private const val ACTION_STOP = "dev.local.newsdigest.action.STOP"
     }
 
     private val binder = LocalBinder()
@@ -117,7 +117,7 @@ class TtsPlaybackService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        mediaSession = MediaSession(this, "RssReaderTts").apply {
+        mediaSession = MediaSession(this, "NewsDigestTts").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() { resume() }
                 override fun onPause() { pause() }

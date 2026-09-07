@@ -1,0 +1,4 @@
+{
+  "accounts": ["work", "personal"],
+  "mail_bin": "/path/to/your/mail-cli"
+}

@@ -1,0 +1,5 @@
+{
+  "token_file": "/path/to/your/calendar-token.json",
+  "calendar_id": "primary",
+  "days_ahead": 2
+}

@@ -1,0 +1,11 @@
+{
+  "sources": [
+    {"name": "rss", "items_file": "~/.cache/rssd/items.jsonl", "enabled": true},
+    {"name": "machine", "items_file": "~/.cache/newsdigest/machine.jsonl", "enabled": false},
+    {"name": "github", "items_file": "~/.cache/newsdigest/github.jsonl", "enabled": false},
+    {"name": "reddit", "items_file": "~/.cache/newsdigest/reddit.jsonl", "enabled": false},
+    {"name": "email", "items_file": "~/.cache/newsdigest/email.jsonl", "enabled": false},
+    {"name": "calendar", "items_file": "~/.cache/newsdigest/calendar.jsonl", "enabled": false},
+    {"name": "jobsearch", "items_file": "~/.cache/newsdigest/jobsearch.jsonl", "enabled": false}
+  ]
+}

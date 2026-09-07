@@ -44,21 +44,21 @@ cd build
 "$D8" --output dex --min-api 29 $(find classes -name "*.class") "$KOTLIN_STDLIB"
 
 echo "=== assemble signed apk ==="
-cp base.apk rssreader-unsigned.apk
+cp base.apk newsdigest-unsigned.apk
 cd dex
-zip -qr ../rssreader-unsigned.apk classes.dex
+zip -qr ../newsdigest-unsigned.apk classes.dex
 cd ..
 
 if [ ! -f ../debug.keystore ]; then
   keytool -genkeypair -v -keystore ../debug.keystore \
     -storepass android -keypass android -alias androiddebugkey \
     -keyalg RSA -keysize 2048 -validity 10000 \
-    -dname "CN=RSS Reader Debug,O=local,C=US"
+    -dname "CN=News Digest Debug,O=local,C=US"
 fi
 
 "$APKSIGNER" sign --ks ../debug.keystore --ks-pass pass:android \
   --key-pass pass:android \
-  --out rssreader-signed.apk rssreader-unsigned.apk
+  --out newsdigest-signed.apk newsdigest-unsigned.apk
 
 echo "=== BUILD_OK ==="
-ls -la rssreader-signed.apk
+ls -la newsdigest-signed.apk
