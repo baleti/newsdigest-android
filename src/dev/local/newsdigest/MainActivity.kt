@@ -101,8 +101,10 @@ class MainActivity : Activity() {
         if (entries.isEmpty()) load()
     }
 
+    // A single action goes directly in the bar (SHOW_AS_ACTION_ALWAYS) -
+    // no point routing one item through a "..." overflow menu.
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
-        menu?.add(0, 1, 0, "Settings")
+        menu?.add(0, 1, 0, "Settings")?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
         return true
     }
 

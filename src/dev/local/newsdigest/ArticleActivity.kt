@@ -29,7 +29,10 @@ class ArticleActivity : Activity() {
         readAloud = ReadAloudController(
             this,
             onStateChanged = { playing ->
+                // Belt-and-suspenders repaint - see DetailActivity's
+                // identical comment for why this wasn't actually the bug.
                 readAloudMenuItem?.title = if (playing) "Stop" else "Read aloud"
+                window.decorView.post { invalidateOptionsMenu() }
                 // Restore the plain view whenever playback stops - whether
                 // the user stopped it or it finished on its own reaching
                 // the end (onStateChanged fires for both).
@@ -64,6 +67,7 @@ class ArticleActivity : Activity() {
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
         readAloudMenuItem = menu?.add(0, 1, 0, if (readAloud.isActive()) "Stop" else "Read aloud")
         readAloudMenuItem?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        SpeedMenu.addTo(menu, readAloud.getSpeed())
         return true
     }
 
@@ -72,6 +76,7 @@ class ArticleActivity : Activity() {
             toggleReadAloud()
             return true
         }
+        if (SpeedMenu.handle(item, readAloud)) return true
         return super.onOptionsItemSelected(item)
     }
 

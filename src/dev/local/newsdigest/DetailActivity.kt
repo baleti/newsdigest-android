@@ -75,7 +75,14 @@ class DetailActivity : Activity() {
         readAloud = ReadAloudController(
             this,
             onStateChanged = { playing ->
+                // Belt-and-suspenders: setTitle() alone isn't guaranteed to
+                // repaint an already-inflated action-bar item on every
+                // OEM skin, so force a rebuild too. (The actual bug behind
+                // "the button never updates" turned out to be a race in
+                // TtsPlaybackService - see its sessionGeneration comment -
+                // not this; kept anyway since it's cheap and correct.)
                 readAloudMenuItem?.title = if (playing) "Stop" else "Read aloud"
+                window.decorView.post { invalidateOptionsMenu() }
                 if (playing) {
                     contentView.movementMethod = null // plain caption while reading, no stray link taps
                 } else {
@@ -114,6 +121,7 @@ class DetailActivity : Activity() {
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
         readAloudMenuItem = menu?.add(0, 1, 0, if (readAloud.isActive()) "Stop" else "Read aloud")
         readAloudMenuItem?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        SpeedMenu.addTo(menu, readAloud.getSpeed())
         return true
     }
 
@@ -122,6 +130,7 @@ class DetailActivity : Activity() {
             toggleReadAloud()
             return true
         }
+        if (SpeedMenu.handle(item, readAloud)) return true
         return super.onOptionsItemSelected(item)
     }
 

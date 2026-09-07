@@ -9,9 +9,12 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaMetadata
+import android.media.PlaybackParams
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Binder
@@ -88,6 +91,19 @@ class TtsPlaybackService : Service() {
     private var seekOffsetMs = 0L // guarded by lock: ms into allSentences[playIndex] to start from
     @Volatile private var seekGeneration = 0 // bumped on every seek/stop; an in-flight write loop checks this to abandon itself early
 
+    // Bumped on every startSession(). Confirmed live: calling stopAll() on
+    // one logical use of this shared service (e.g. stopping a chat-reply
+    // read-aloud right before starting the main-content one) queues a
+    // mainHandler.post{} for onQueueIdle - and since that post reads the
+    // (mutable, shared) listener/active state only once it actually runs,
+    // a startSession() that happens in the meantime races it: the new
+    // session's onStateChanged(true) fires, then this stale post runs and
+    // immediately fires onStateChanged(false), because from its own stale
+    // point of view nothing is playing. The onQueueIdle call sites below
+    // capture sessionGeneration at post-time and only actually deliver the
+    // signal if nothing newer has started since.
+    @Volatile private var sessionGeneration = 0
+
     private var playThread: Thread? = null
     @Volatile private var playing = false
     @Volatile private var stopRequested = false
@@ -103,7 +119,7 @@ class TtsPlaybackService : Service() {
     private var audioTrack: AudioTrack? = null
     private var mediaSession: MediaSession? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var currentTitle: String = "RSS Reader"
+    private var currentTitle: String = "News Digest"
     @Volatile private var lastSentenceText: String = "Preparing..."
 
     // Lets pause()/resume()/seekTo() report a sensible interpolated
@@ -115,8 +131,51 @@ class TtsPlaybackService : Service() {
     @Volatile private var posAnchorAtNanos: Long = System.nanoTime()
     @Volatile private var posAnchorPlaying: Boolean = false
 
+    // Playback speed (AudioTrack.setPlaybackParams does real time-
+    // stretching, not just resampling, so pitch stays natural at any
+    // speed). The word-highlighter's timer needs its own anchor here too
+    // - changing speed mid-sentence would otherwise retroactively
+    // reinterpret time already elapsed under the OLD speed, jumping the
+    // highlighted word instead of smoothly changing pace from that point on.
+    @Volatile private var playbackSpeed: Float = 1.0f
+    @Volatile private var highlightAnchorMs: Long = 0L
+    @Volatile private var highlightAnchorAtNanos: Long = System.nanoTime()
+
+    // AudioTrack plays regardless of what else is making noise - it does
+    // NOT request audio focus on its own, so without this, starting a
+    // read-aloud session while music/a video was already playing left
+    // both audible at once instead of the other one pausing (confirmed
+    // live: this was exactly that bug, not a race in the playback code).
+    private lateinit var audioManager: AudioManager
+    private var focusRequest: AudioFocusRequest? = null
+    @Volatile private var hasAudioFocus = false
+    @Volatile private var pausedByFocusLoss = false
+
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        when (change) {
+            AudioManager.AUDIOFOCUS_LOSS -> stopAll()
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Pause rather than duck under it even for the "can duck"
+                // case - this is spoken content, not background music, so
+                // playing quietly under something else is still unlistenable.
+                if (playing) {
+                    pausedByFocusLoss = true
+                    pause()
+                }
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                if (pausedByFocusLoss) {
+                    pausedByFocusLoss = false
+                    resume()
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
+        audioManager = getSystemService(AudioManager::class.java)
         mediaSession = MediaSession(this, "NewsDigestTts").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() { resume() }
@@ -127,6 +186,34 @@ class TtsPlaybackService : Service() {
             setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
             isActive = true
         }
+    }
+
+    /** AUDIOFOCUS_GAIN_TRANSIENT: tells other media apps to pause (not
+     * duck) while we're reading, and to resume once we abandon focus -
+     * exactly "interrupt what's playing, then hand it back", which is
+     * what starting a read-aloud session over existing playback should do. */
+    private fun requestAudioFocus(): Boolean {
+        if (hasAudioFocus) return true
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .setOnAudioFocusChangeListener(focusListener, mainHandler)
+            .build()
+        focusRequest = request
+        hasAudioFocus = audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (!hasAudioFocus) Log.w(TAG, "audio focus request denied - playing anyway")
+        return hasAudioFocus
+    }
+
+    private fun abandonAudioFocus() {
+        if (!hasAudioFocus) return
+        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        hasAudioFocus = false
+        pausedByFocusLoss = false
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -145,6 +232,8 @@ class TtsPlaybackService : Service() {
     }
 
     fun startSession(title: String) {
+        sessionGeneration++ // invalidate any onQueueIdle already queued from a stop before this
+        requestAudioFocus()
         currentTitle = title
         stopRequested = false
         idleSignaled = false
@@ -200,11 +289,29 @@ class TtsPlaybackService : Service() {
     }
 
     fun resume() {
+        requestAudioFocus()
         setPositionAnchor(estimatedPositionMs(), true)
         playing = true
         audioTrack?.play()
         updatePlaybackState(PlaybackState.STATE_PLAYING)
         updateNotification(lastSentenceText)
+    }
+
+    /** 1.0 = normal. Takes effect immediately, including mid-sentence. */
+    fun setPlaybackSpeed(speed: Float) {
+        // Rebase the highlight anchor using the OLD speed before swapping
+        // it in, so time already elapsed stays interpreted the way it was
+        // actually played, and only time from this instant on speeds up.
+        val elapsedAtOldSpeed = highlightAnchorMs +
+            ((System.nanoTime() - highlightAnchorAtNanos) / 1_000_000.0 * playbackSpeed).toLong()
+        highlightAnchorMs = elapsedAtOldSpeed
+        highlightAnchorAtNanos = System.nanoTime()
+        playbackSpeed = speed
+        try {
+            audioTrack?.playbackParams = PlaybackParams().setSpeed(speed).setPitch(1.0f)
+        } catch (e: Exception) {
+            Log.e(TAG, "setPlaybackSpeed failed: ${e.message}")
+        }
     }
 
     /** Jumps to an absolute position (ms) across all sentences synthesized
@@ -227,6 +334,7 @@ class TtsPlaybackService : Service() {
             newPosMs += remaining
         }
         seekGeneration++ // an in-flight write loop sees this and abandons itself; playLoop re-reads playIndex/seekOffsetMs
+        requestAudioFocus()
         audioTrack?.let { try { it.pause(); it.flush() } catch (_: Exception) {} }
         playing = true
         setPositionAnchor(newPosMs, true)
@@ -249,7 +357,9 @@ class TtsPlaybackService : Service() {
         }
         updatePlaybackState(PlaybackState.STATE_STOPPED)
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-        mainHandler.post { listener?.onQueueIdle() }
+        abandonAudioFocus()
+        val myGen = sessionGeneration
+        mainHandler.post { if (sessionGeneration == myGen) listener?.onQueueIdle() }
     }
 
     private fun ensurePlayThread() {
@@ -284,7 +394,9 @@ class TtsPlaybackService : Service() {
                 // expected and fine (see sessionEnded's doc comment).
                 if (sessionEnded && !idleSignaled) {
                     idleSignaled = true
-                    mainHandler.post { listener?.onQueueIdle() }
+                    abandonAudioFocus() // reading finished on its own - hand focus back
+                    val myGen = sessionGeneration
+                    mainHandler.post { if (sessionGeneration == myGen) listener?.onQueueIdle() }
                 }
                 Thread.sleep(100)
                 continue
@@ -294,6 +406,11 @@ class TtsPlaybackService : Service() {
             if (audioTrack == null || audioTrack?.sampleRate != current.sampleRate) {
                 audioTrack?.release()
                 audioTrack = buildAudioTrack(current.sampleRate)
+                try {
+                    audioTrack?.playbackParams = PlaybackParams().setSpeed(playbackSpeed).setPitch(1.0f)
+                } catch (e: Exception) {
+                    Log.e(TAG, "applying playback speed to new AudioTrack failed: ${e.message}")
+                }
             }
             val track = audioTrack ?: continue
 
@@ -306,12 +423,18 @@ class TtsPlaybackService : Service() {
                 updateNotification(current.text)
             }
 
-            val startNanos = System.nanoTime() - startOffsetMs * 1_000_000
+            highlightAnchorMs = startOffsetMs
+            highlightAnchorAtNanos = System.nanoTime()
             val highlighter = object : Runnable {
                 var idx = 0
                 override fun run() {
                     if (stopRequested || seekGeneration != myGeneration) return
-                    val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+                    // Reads playbackSpeed live (not captured at sentence
+                    // start) so a mid-sentence speed change takes effect
+                    // immediately - setPlaybackSpeed() rebases the anchor
+                    // itself so this stays continuous across that change.
+                    val elapsedMs = highlightAnchorMs +
+                        ((System.nanoTime() - highlightAnchorAtNanos) / 1_000_000.0 * playbackSpeed).toLong()
                     while (idx < current.words.size && elapsedMs >= current.words[idx].endMs) idx++
                     if (idx < current.words.size) {
                         listener?.onWordHighlight(idx)
@@ -404,7 +527,7 @@ class TtsPlaybackService : Service() {
         val nm = getSystemService(NotificationManager::class.java)
         if (nm.getNotificationChannel(CHANNEL_ID) == null) {
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "RSS Reader playback", NotificationManager.IMPORTANCE_LOW),
+                NotificationChannel(CHANNEL_ID, "News Digest playback", NotificationManager.IMPORTANCE_LOW),
             )
         }
         val playPauseAction = if (playing) {

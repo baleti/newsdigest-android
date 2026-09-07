@@ -43,6 +43,7 @@ class ReadAloudController(
     private var currentWordRanges: List<IntRange> = emptyList()
     private var highlightSpan: BackgroundColorSpan? = null
     @Volatile private var active = false
+    @Volatile private var currentSpeed = 1.0f
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -142,6 +143,7 @@ class ReadAloudController(
             return
         }
         svc.startSession(title)
+        svc.setPlaybackSpeed(currentSpeed)
 
         wsThread = Thread {
             val client = WebSocketClient(
@@ -220,6 +222,16 @@ class ReadAloudController(
 
     fun pause() = ttsService?.pause()
     fun resume() = ttsService?.resume()
+
+    /** Remembered for the next start() too, not just applied live - so
+     * picking a speed sticks across separate read-aloud sessions instead
+     * of quietly resetting to 1.0x each time. */
+    fun setSpeed(speed: Float) {
+        currentSpeed = speed
+        ttsService?.setPlaybackSpeed(speed)
+    }
+
+    fun getSpeed(): Float = currentSpeed
 
     /** Sequentially matches each timed word against the sentence text to
      * find its character range - the words are exactly the sentence's own

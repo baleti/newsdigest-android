@@ -10,6 +10,11 @@ import android.content.Context
  * port, so there's only one host/port pair to configure - no separate
  * token, since that server's security is the WireGuard tunnel + a fixed
  * non-secret header (see server.py's docstring), not a credential.
+ *
+ * Each field saves itself the moment it changes (see SettingsActivity) -
+ * there's no separate Save button/step, and no "configured" flag to fall
+ * out of sync with the fields it's supposed to describe: a non-blank host
+ * is by definition all "configured" means.
  */
 object Settings {
     private const val PREFS = "newsdigest_prefs"
@@ -20,17 +25,22 @@ object Settings {
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    fun isConfigured(context: Context): Boolean =
-        prefs(context).getBoolean("configured", false)
+    fun isConfigured(context: Context): Boolean = getHost(context).isNotBlank()
 
-    fun save(context: Context, host: String, port: Int, engine: String, account: String) {
-        prefs(context).edit()
-            .putString("host", host)
-            .putInt("tts_port", port)
-            .putString("engine", engine)
-            .putString("account", account)
-            .putBoolean("configured", true)
-            .apply()
+    fun setHost(context: Context, host: String) {
+        prefs(context).edit().putString("host", host).apply()
+    }
+
+    fun setTtsPort(context: Context, port: Int) {
+        prefs(context).edit().putInt("tts_port", port).apply()
+    }
+
+    fun setTtsEngine(context: Context, engine: String) {
+        prefs(context).edit().putString("engine", engine).apply()
+    }
+
+    fun setAccount(context: Context, account: String) {
+        prefs(context).edit().putString("account", account).apply()
     }
 
     fun getHost(context: Context): String = prefs(context).getString("host", "") ?: ""
