@@ -28,6 +28,14 @@ class ReadAloudController(
     private val context: Context,
     private val onStateChanged: (playing: Boolean) -> Unit,
     private val onCaptionChanged: (CharSequence) -> Unit,
+    // Fires true right after a sentence finishes playing and there's
+    // nothing queued yet to follow it, false once the next one actually
+    // starts. Chatterbox in particular can take 5-15s to synthesize a
+    // sentence - streaming means that gap is expected (see server.py's
+    // docs), but with no visual cue it reads as the app having frozen
+    // rather than still working. Optional - callers that don't care about
+    // showing a "still generating..." indicator can just leave it out.
+    private val onGenerating: (Boolean) -> Unit = {},
 ) {
     private var ttsService: TtsPlaybackService? = null
     private var bound = false
@@ -50,6 +58,7 @@ class ReadAloudController(
     private val highlightListener = object : TtsPlaybackService.HighlightListener {
         override fun onSentenceStart(text: String, words: List<WordTiming>) {
             mainHandler.post {
+                onGenerating(false)
                 // Locate this sentence inside the text that's already on
                 // screen rather than appending it - the server's sentence
                 // text is the same string this controller sent it (see
@@ -84,10 +93,13 @@ class ReadAloudController(
             }
         }
 
-        override fun onSentenceEnd() {}
+        override fun onSentenceEnd() {
+            mainHandler.post { onGenerating(true) }
+        }
 
         override fun onQueueIdle() {
             mainHandler.post {
+                onGenerating(false)
                 if (active) {
                     active = false
                     onStateChanged.invoke(false)
@@ -134,6 +146,7 @@ class ReadAloudController(
         active = true
         onStateChanged.invoke(true)
         onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
+        onGenerating(true) // nothing synthesized yet either - same "still working" state as a mid-read gap
 
         val svc = ttsService
         if (svc == null) {
@@ -215,6 +228,7 @@ class ReadAloudController(
 
     fun stop() {
         active = false
+        onGenerating(false)
         ws?.close()
         ws = null
         ttsService?.stopAll()

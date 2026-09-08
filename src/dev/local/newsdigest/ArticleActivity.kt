@@ -6,6 +6,7 @@ import android.text.Html
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
+import android.view.View
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -17,6 +18,7 @@ class ArticleActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var readAloud: ReadAloudController
     private lateinit var contentView: TextView
+    private var generatingView: TextView? = null
     private var readAloudMenuItem: MenuItem? = null
     private var plainText: String = ""
     private var articleTitle: String = ""
@@ -39,6 +41,12 @@ class ArticleActivity : Activity() {
                 if (!playing) contentView.text = plainText
             },
             onCaptionChanged = { caption -> if (readAloud.isActive()) contentView.text = caption },
+            onGenerating = { generating ->
+                // Chatterbox especially can take 5-15s per sentence -
+                // without this, a gap between sentences reads as the app
+                // having frozen rather than still working (confirmed live).
+                generatingView?.visibility = if (generating) View.VISIBLE else View.GONE
+            },
         )
         readAloud.bind()
 
@@ -109,6 +117,14 @@ class ArticleActivity : Activity() {
                         setPadding(0, dp(16), 0, 0)
                     }
                     root.addView(contentView)
+                    generatingView = TextView(this).apply {
+                        text = "Still generating the next part…"
+                        textSize = 12f
+                        setTextColor(Theme.muted)
+                        setPadding(0, dp(10), 0, 0)
+                        visibility = View.GONE
+                    }
+                    root.addView(generatingView)
                 }
             } catch (e: Exception) {
                 Log.e("NewsDigest", "article load failed", e)

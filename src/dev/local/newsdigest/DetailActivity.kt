@@ -39,6 +39,7 @@ class DetailActivity : Activity() {
     private lateinit var titleView: TextView
     private lateinit var subtitleView: TextView
     private lateinit var contentView: TextView
+    private lateinit var generatingView: TextView
     private var readAloudMenuItem: MenuItem? = null
     private lateinit var chatContainer: LinearLayout
     private lateinit var inputField: EditText
@@ -100,6 +101,12 @@ class DetailActivity : Activity() {
             },
             onCaptionChanged = { caption ->
                 if (readAloud.isActive()) contentView.text = caption
+            },
+            onGenerating = { generating ->
+                // Chatterbox especially can take 5-15s per sentence -
+                // without this, a gap between sentences reads as the app
+                // having frozen rather than still working (confirmed live).
+                generatingView.visibility = if (generating) View.VISIBLE else View.GONE
             },
         )
         readAloud.bind()
@@ -165,10 +172,18 @@ class DetailActivity : Activity() {
             movementMethod = LinkMovementMethod.getInstance()
             setLinkTextColor(Theme.linkColor)
         }
+        generatingView = TextView(this).apply {
+            text = "Still generating the next part…"
+            textSize = 12f
+            setTextColor(Theme.muted)
+            setPadding(0, dp(10), 0, 0)
+            visibility = View.GONE
+        }
 
         contentContainer.addView(titleView)
         contentContainer.addView(subtitleView)
         contentContainer.addView(contentView)
+        contentContainer.addView(generatingView)
         contentContainer.addView(spacer(28))
         chatContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         contentContainer.addView(chatContainer)
@@ -206,13 +221,14 @@ class DetailActivity : Activity() {
 
     private fun loadDigest() {
         val date = intent.getStringExtra("date") ?: ""
+        val topic = intent.getStringExtra("topic") ?: "Today"
         val markdown = intent.getStringExtra("markdown") ?: ""
         isDigest = true
-        titleView.text = "Today's digest"
+        titleView.text = topic
         subtitleView.text = date
         rawContent = markdown
-        contentForChat = "Today's RSS digest ($date):\n\n$markdown"
-        sourceTitle = "Today's digest ($date)"
+        contentForChat = "Today's \"$topic\" digest ($date):\n\n$markdown"
+        sourceTitle = "$topic ($date)"
         sourceLink = ""
         contentView.text = MarkdownRenderer.render(markdown) { url -> openArticle(url) }
     }

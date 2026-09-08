@@ -290,8 +290,12 @@ def feed_favicon(host: str):
     return FileResponse(path, media_type=mime)
 
 
-@app.get("/feed/digest")
-def feed_digest():
+@app.get("/feed/digests")
+def feed_digests():
+    """{"date": ..., "digests": [{"topic", "markdown", "references"}, ...]}
+    - however many topic-clustered digests the last generation run found
+    in that day's material (see generate-digest.sh.example); not a fixed
+    count or fixed set of topics."""
     digest = feed.latest_digest()
     if digest is None:
         return JSONResponse({"error": "no digest yet"}, status_code=404)

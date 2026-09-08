@@ -111,6 +111,11 @@ def favicon_file(host: str) -> tuple[Path, str] | None:
 
 
 def latest_digest() -> dict | None:
+    """{"date": ..., "digests": [{"topic", "markdown", "references"}, ...]} -
+    see build_digest_json.py for how the topic split is produced. However
+    many digests there are, and whatever they're about, comes entirely
+    from what the generator actually found in that day's sources - never
+    a fixed count or fixed set of topics."""
     p = DIGEST_DIR / "latest.json"
     if not p.exists():
         return None

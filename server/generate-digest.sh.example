@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Generates a daily digest via an LLM and writes it (plus an extracted
-# references list) to ~/.cache/newsdigest-server/digest/ for the app to
-# pull from /feed/digest.
+# Generates today's digests via an LLM, clustering the day's material
+# into however many topics it actually falls into, and writes them (plus
+# per-topic extracted references) to ~/.cache/newsdigest-server/digest/
+# for the app to pull from /feed/digests.
 #
 # This is an EXAMPLE - copy it outside the repo (it's not meant to be run
 # as-is) and fill in the marked section with your own personalization.
@@ -34,14 +35,23 @@ Filter to items published or fetched in roughly the last 24 hours.
 # are actually worth your time, and how they connect to what you're
 # working on.
 
-Write today's digest as a short piece of narrative writing - like an
+Group today's items into whatever topics they actually fall into - do NOT
+use a fixed set of categories. Look at what's actually there and let the
+grouping fall out of it: some days might genuinely split into several
+distinct topics, other days might just be one broad "today" if there's
+no real separation. The number and nature of topics should depend
+entirely on today's material, never on a template. Don't force an item
+into a topic it doesn't belong in just to fill one out, and don't create
+a topic for one throwaway item - fold stragglers into the closest
+reasonable topic or a general one.
+
+Write EACH topic as its own short piece of narrative writing - like an
 entry in a personal newsletter written directly to you, not a bulleted
-report. Pick out the handful of items that are genuinely most
-interesting across ALL the sources above, not just one - a quiet news
-day with an interesting commit or calendar clash is still worth a
-sentence. Let one item flow into the next with real transitions, the way
-someone telling you about their day would, rather than restarting
-structure for each one. A handful of paragraphs, a few hundred words.
+report. Within a topic, let one item flow into the next with real
+transitions, the way someone telling you about their day would, rather
+than restarting structure for each item. A few paragraphs per topic is
+plenty; a topic with only one or two items can be a single short
+paragraph.
 
 Every story or item you mention by name must carry a markdown link
 [label](url) to its original link field, when it has one - never mention
@@ -50,9 +60,18 @@ the source files. Also name where each item is FROM in the prose itself,
 using its feed_title field - not only via the link - since someone
 reading this aloud through text-to-speech never sees a URL or its domain.
 
-Output ONLY the finished piece - no preamble, no meta-commentary, no
-"here is the digest". Your entire response is saved verbatim as today's
-digest file.
+Output format - this is machine-parsed, follow it exactly: separate each
+topic with a line reading exactly "===TOPIC: <short topic name>===" (no
+markdown formatting on that line itself), followed by that topic's
+narrative. Nothing else outside that structure - no preamble, no overall
+title, no meta-commentary. Your entire response is saved verbatim and
+split on those markers.
+
+Example shape (not real content):
+===TOPIC: Job Search===
+<narrative for this topic>
+===TOPIC: Programming===
+<narrative for this topic>
 PROMPT
 )" > "$TMP"
 
