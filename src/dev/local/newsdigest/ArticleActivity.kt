@@ -115,6 +115,10 @@ class ArticleActivity : Activity() {
                         setTextColor(Theme.onBackground)
                         setLineSpacing(dp(4).toFloat(), 1f)
                         setPadding(0, dp(16), 0, 0)
+                        // Needed for ReadAloudController's per-word seek
+                        // spans to actually receive taps - this plain
+                        // extracted text has no other links to worry about.
+                        movementMethod = android.text.method.LinkMovementMethod.getInstance()
                     }
                     root.addView(contentView)
                     generatingView = TextView(this).apply {

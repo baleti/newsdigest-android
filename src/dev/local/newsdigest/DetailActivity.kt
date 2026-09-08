@@ -85,7 +85,12 @@ class DetailActivity : Activity() {
                 readAloudMenuItem?.title = if (playing) "Stop" else "Read aloud"
                 window.decorView.post { invalidateOptionsMenu() }
                 if (playing) {
-                    contentView.movementMethod = null // plain caption while reading, no stray link taps
+                    // The plain caption has no real hyperlinks of its own
+                    // (see ReadAloudController's docstring) - the only
+                    // ClickableSpans in it are the per-word seek targets
+                    // it adds itself, so LinkMovementMethod here is safe
+                    // and is what lets tapping a word actually seek.
+                    contentView.movementMethod = LinkMovementMethod.getInstance()
                 } else {
                     // Restore the rich static view whenever playback
                     // stops - whether the user stopped it or it finished

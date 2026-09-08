@@ -7,9 +7,13 @@ import android.content.ServiceConnection
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.text.Spanned
 import android.text.SpannableStringBuilder
+import android.text.TextPaint
 import android.text.style.BackgroundColorSpan
+import android.text.style.ClickableSpan
 import android.util.Log
+import android.view.View
 import org.json.JSONObject
 
 /**
@@ -23,6 +27,14 @@ import org.json.JSONObject
  * Highlighting inside a separately-rendered rich view risks the two texts
  * drifting out of sync character-for-character, so this deliberately
  * isn't that.
+ *
+ * Every word gets a tap target from the moment reading starts, not just
+ * ones already spoken - tapping one that's already synthesized seeks
+ * straight to it (TtsPlaybackService.seekTo); tapping one further ahead
+ * than the server has gotten to skips there instead of waiting: the
+ * current stream is abandoned and a new one is started from that word,
+ * so whatever was between the old and new position is simply never
+ * synthesized, not queued up behind the jump.
  */
 class ReadAloudController(
     private val context: Context,
@@ -46,24 +58,39 @@ class ReadAloudController(
     // Reading highlights a moving span inside it instead of replacing it,
     // so the on-screen content never disappears once playback starts.
     private val captionBuilder = SpannableStringBuilder()
+    private var fullText = ""
     private var searchCursor = 0
     private var currentSentenceStartOffset = 0
     private var currentWordRanges: List<IntRange> = emptyList()
     private var highlightSpan: BackgroundColorSpan? = null
     @Volatile private var active = false
     @Volatile private var currentSpeed = 1.0f
+    // Bumped every streamText() call. skipAheadTo() closes the old socket
+    // before opening a new one, but a hand-rolled WebSocketClient reading
+    // in its own thread could still have one message already in flight
+    // when close() is called - each stream's callbacks check this before
+    // touching shared state, so a stale message from an abandoned stream
+    // can't enqueue a "skipped" sentence after the jump.
+    @Volatile private var streamGeneration = 0
+
+    /** One entry per word we actually have synthesis timing for, in the
+     * order sentences arrived - spans the whole session, not just the
+     * currently-highlighting sentence (unlike currentWordRanges), so a
+     * tap can seek into anything already read, not only the live one. */
+    private data class KnownWord(val charStart: Int, val charEnd: Int, val ms: Long)
+    private val knownWords = mutableListOf<KnownWord>()
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val highlightListener = object : TtsPlaybackService.HighlightListener {
-        override fun onSentenceStart(text: String, words: List<WordTiming>) {
+        override fun onSentenceStart(text: String, words: List<WordTiming>, startMs: Long) {
             mainHandler.post {
                 onGenerating(false)
                 // Locate this sentence inside the text that's already on
                 // screen rather than appending it - the server's sentence
                 // text is the same string this controller sent it (see
-                // start() below), so it should always be found forward of
-                // the last match.
+                // streamText() below), so it should always be found
+                // forward of the last match.
                 var idx = captionBuilder.toString().indexOf(text, searchCursor)
                 if (idx < 0) idx = captionBuilder.toString().indexOf(text) // shouldn't happen; best effort
                 if (idx < 0) {
@@ -73,6 +100,17 @@ class ReadAloudController(
                 currentSentenceStartOffset = idx
                 searchCursor = idx + text.length
                 currentWordRanges = computeWordRanges(text, words)
+
+                for ((i, range) in currentWordRanges.withIndex()) {
+                    if (range.isEmpty()) continue
+                    knownWords.add(
+                        KnownWord(
+                            currentSentenceStartOffset + range.first,
+                            currentSentenceStartOffset + range.last + 1,
+                            startMs + words[i].startMs,
+                        ),
+                    )
+                }
             }
         }
 
@@ -86,7 +124,7 @@ class ReadAloudController(
                     span,
                     currentSentenceStartOffset + range.first,
                     currentSentenceStartOffset + range.last + 1,
-                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
                 )
                 highlightSpan = span
                 onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
@@ -139,8 +177,11 @@ class ReadAloudController(
     /** title is what shows in the media notification while this plays. */
     fun start(title: String, text: String) {
         stop()
+        fullText = text
+        knownWords.clear()
         captionBuilder.clear()
         captionBuilder.append(text) // shown in full immediately - reading only ever highlights within this, never replaces it
+        attachWordSpans(text)
         searchCursor = 0
         highlightSpan = null
         active = true
@@ -157,6 +198,68 @@ class ReadAloudController(
         }
         svc.startSession(title)
         svc.setPlaybackSpeed(currentSpeed)
+        streamText(text, svc)
+    }
+
+    /** One ClickableSpan per whitespace-delimited word across the WHOLE
+     * text, attached up front - not only the parts already synthesized.
+     * Each span's onClick re-checks knownWords at tap time (not at
+     * attach time), so the very same span transparently seeks once its
+     * word has been read, or skips ahead if it hasn't yet - no need to
+     * ever swap a span out as synthesis catches up to it. */
+    private fun attachWordSpans(text: String) {
+        for (m in Regex("\\S+").findAll(text)) {
+            val wordStart = m.range.first
+            val wordEnd = m.range.last + 1
+            captionBuilder.setSpan(
+                object : ClickableSpan() {
+                    override fun onClick(widget: View) = handleWordTap(wordStart)
+                    // No underline/color - reads as plain text, not a hyperlink.
+                    override fun updateDrawState(ds: TextPaint) {}
+                },
+                wordStart,
+                wordEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+    }
+
+    private fun handleWordTap(charOffset: Int) {
+        if (!active) return
+        val hit = knownWords.find { charOffset in it.charStart until it.charEnd }
+        if (hit != null) {
+            ttsService?.seekTo(hit.ms)
+        } else {
+            skipAheadTo(charOffset)
+        }
+    }
+
+    /** Abandons the current stream and starts a fresh one from charOffset
+     * - whatever was between wherever the server had gotten to and this
+     * new point is simply never synthesized, rather than making you wait
+     * for it. Already-synthesized audio before charOffset is untouched
+     * (still there to tap/seek back into); TtsPlaybackService.jumpToUpcoming()
+     * is what makes the NEXT enqueued sentence play immediately instead of
+     * whatever was still mid-flight. */
+    private fun skipAheadTo(charOffset: Int) {
+        val svc = ttsService ?: return
+        val clamped = charOffset.coerceIn(0, fullText.length)
+        val resumeText = fullText.substring(clamped).trimStart()
+        if (resumeText.isBlank()) return
+        ws?.close() // stop the old stream's remaining sentences from arriving after the new ones
+        svc.jumpToUpcoming()
+        searchCursor = fullText.length - resumeText.length
+        onGenerating(true)
+        streamText(resumeText, svc)
+    }
+
+    /** Connects to /tts/stream, sends `text`, and enqueues every sentence
+     * that comes back onto `svc` as it arrives. Used both for the initial
+     * read and for resuming after skipAheadTo() - the only difference is
+     * whether the caller already reset the service's session state first. */
+    private fun streamText(text: String, svc: TtsPlaybackService) {
+        val myGeneration = ++streamGeneration
+        fun isCurrent() = streamGeneration == myGeneration
 
         wsThread = Thread {
             val client = WebSocketClient(
@@ -177,6 +280,7 @@ class ReadAloudController(
                 }
 
                 override fun onText(text: String) {
+                    if (!isCurrent()) return
                     val obj = JSONObject(text)
                     when (obj.optString("type")) {
                         "sentence" -> pendingMeta = obj
@@ -203,6 +307,7 @@ class ReadAloudController(
                 }
 
                 override fun onBinary(data: ByteArray) {
+                    if (!isCurrent()) return
                     val meta = pendingMeta ?: return
                     val words = mutableListOf<WordTiming>()
                     val wordsArray = meta.optJSONArray("words")
@@ -216,6 +321,7 @@ class ReadAloudController(
                 }
 
                 override fun onFailure(error: Throwable) {
+                    if (!isCurrent()) return // expected: skipAheadTo()'s ws.close() surfaces as a failure on the abandoned stream
                     Log.e("ReadAloudController", "websocket failed", error)
                     mainHandler.post {
                         active = false
@@ -229,6 +335,7 @@ class ReadAloudController(
     fun stop() {
         active = false
         onGenerating(false)
+        streamGeneration++ // suppress any late callback from whatever stream this abandons
         ws?.close()
         ws = null
         ttsService?.stopAll()

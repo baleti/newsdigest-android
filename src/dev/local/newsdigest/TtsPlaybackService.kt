@@ -60,7 +60,12 @@ private data class QueuedSentence(
 class TtsPlaybackService : Service() {
 
     interface HighlightListener {
-        fun onSentenceStart(text: String, words: List<WordTiming>) {}
+        /** startMs is this sentence's absolute position from the top of
+         * the whole session - i.e. what seekTo() would need to jump back
+         * to its first word - regardless of any seekOffsetMs used to
+         * resume mid-sentence. Lets a caller build "tap a word to seek
+         * there" without duplicating this service's own position math. */
+        fun onSentenceStart(text: String, words: List<WordTiming>, startMs: Long) {}
         fun onWordHighlight(wordIndex: Int) {}
         fun onSentenceEnd() {}
         fun onQueueIdle() {}
@@ -341,6 +346,30 @@ class TtsPlaybackService : Service() {
         updatePlaybackState(PlaybackState.STATE_PLAYING)
     }
 
+    /** For "skip ahead past what's been synthesized so far": positions
+     * the session so the NEXT enqueueSentence() call becomes the very
+     * next thing played, abandoning whatever was still mid-flight for
+     * the gap being skipped - that gap is simply never synthesized, not
+     * queued up behind the jump. Unlike seekTo(), this doesn't require
+     * the target to already exist in allSentences - the caller is about
+     * to stream fresh sentences that will land at exactly this index. */
+    fun jumpToUpcoming() {
+        val resumeMs: Long
+        synchronized(lock) {
+            playIndex = allSentences.size
+            seekOffsetMs = 0L
+            resumeMs = positionMsUpTo(allSentences.size)
+        }
+        seekGeneration++
+        sessionEnded = false // a fresh stream is about to start - not done yet
+        idleSignaled = false
+        requestAudioFocus()
+        audioTrack?.let { try { it.pause(); it.flush() } catch (_: Exception) {} }
+        playing = true
+        setPositionAnchor(resumeMs, true)
+        updatePlaybackState(PlaybackState.STATE_PLAYING)
+    }
+
     fun stopAll() {
         stopRequested = true
         playing = false
@@ -416,10 +445,11 @@ class TtsPlaybackService : Service() {
 
             playing = true
             track.play()
-            setPositionAnchor(positionMsUpTo(index) + startOffsetMs, true)
+            val sentenceStartMs = positionMsUpTo(index)
+            setPositionAnchor(sentenceStartMs + startOffsetMs, true)
             updatePlaybackState(PlaybackState.STATE_PLAYING)
             mainHandler.post {
-                listener?.onSentenceStart(current.text, current.words)
+                listener?.onSentenceStart(current.text, current.words, sentenceStartMs)
                 updateNotification(current.text)
             }
 
