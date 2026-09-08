@@ -58,7 +58,7 @@ from text_clean import markdown_to_speech
 # `claude --resume`, and durable delivery (a message lands in the live pane
 # if one exists, else queues to disk until it does). Reusing it here beats
 # reimplementing the same tmux-spawn/poll machinery a second time.
-CLAUDE_AGENTS_URL = os.environ.get("NEWSDIGEST_CLAUDE_AGENTS_URL", "http://10.10.0.2:8790")
+CLAUDE_AGENTS_URL = os.environ.get("NEWSDIGEST_CLAUDE_AGENTS_URL", "http://127.0.0.1:8790")
 CLAUDE_AGENTS_TOKEN_FILE = Path.home() / ".config" / "claude-agents" / "token"
 ALLOWED_AGENT_ACCOUNTS = {"claude", "claude2", "claude3"}
 

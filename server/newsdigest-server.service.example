@@ -9,6 +9,9 @@ Environment=HF_HOME=%h/.cache/newsdigest-server/hf
 # start without both. See ../README.md.
 Environment=NEWSDIGEST_BIND_HOST=10.0.0.1
 Environment=NEWSDIGEST_ALLOWED_SUBNET=10.0.0.0/24
+# Optional - only needed for article chat, see README's "Article chat".
+# Defaults to http://127.0.0.1:8790 (same host) if unset.
+Environment=NEWSDIGEST_CLAUDE_AGENTS_URL=http://10.0.0.1:8790
 # Point these at wherever you actually cloned this repo - running the
 # server straight out of the repo (rather than a separately-maintained
 # copy) means `git pull` is the only update step, nothing to keep in sync.

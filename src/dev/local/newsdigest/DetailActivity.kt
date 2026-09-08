@@ -378,6 +378,17 @@ class DetailActivity : Activity() {
         chatContainer.addView(row)
     }
 
+    private fun addToolStatusLine(text: String) {
+        chatContainer.addView(
+            TextView(this).apply {
+                this.text = text
+                textSize = 11f
+                setTextColor(Theme.onSurfaceVariant)
+                setPadding(dp(14), dp(2), dp(14), dp(2))
+            },
+        )
+    }
+
     private fun showChatBusy(busy: Boolean) {
         chatBusyRow?.let { chatContainer.removeView(it) }
         chatBusyRow = null
@@ -407,7 +418,26 @@ class DetailActivity : Activity() {
             this,
             onSessionReady = { _, resumed -> if (!resumed) Log.i("NewsDigest", "chat: spawned new session") },
             onMessages = { messages ->
-                for (m in messages) addChatBubble(if (m.role == "user") "You" else "Assistant", m.text)
+                for (m in messages) {
+                    when {
+                        // The raw output of a Bash/Read/etc call being fed
+                        // back to Claude - can be many KB of file content
+                        // (confirmed live: an assistant reply that
+                        // consulted memory files dumped whole file bodies
+                        // as separate "Assistant" bubbles here before this
+                        // filter existed). Not conversational content, so
+                        // it doesn't belong in this thread at all - matches
+                        // claudeagents-android's own ChatActivity treatment.
+                        m.role == "tool_result" -> {}
+                        m.role == "user" -> addChatBubble("You", m.text)
+                        // "→ Bash: ..." / "→ Read(...)" - a tool call
+                        // summary, not prose - a one-line muted status
+                        // row rather than a full bubble with its own
+                        // "Read aloud" button.
+                        m.text.startsWith("→ ") -> addToolStatusLine(m.text)
+                        else -> addChatBubble("Assistant", m.text)
+                    }
+                }
                 scrollToBottom()
             },
             onBusyChanged = { busy -> showChatBusy(busy) },

@@ -5,8 +5,9 @@ natural-sounding text-to-speech, over your own private network - no cloud
 TTS API, no tracking, no ads. It started as an RSS reader; the server side
 now merges RSS with whatever other activity sources you point it at (git
 activity, a bot's own posts, calendar, email headers, ...) into one feed,
-and you can ask an agent questions about any item with the reply read back
-to you in real time as it's generated.
+and you can ask an agent questions about any digest article - a real,
+persistent conversation (see [Article chat](#article-chat)) you can
+return to later, not a one-off Q&A that's gone once you leave the screen.
 
 > **Assumption:** you already have a private tunnel (WireGuard or
 > equivalent) between your phone and the machine running `server/`. This
@@ -21,9 +22,9 @@ Two halves, one repo:
 
 - **`server/`** — a Python server (FastAPI) that runs your choice of TTS
   engine, cleans up text before synthesis (acronym expansion, markdown
-  stripping), merges one or more activity sources into a feed, streams an
-  agent-chat reply sentence-by-sentence as it's generated, and serves it
-  all to the app.
+  stripping), merges one or more activity sources into a feed, proxies
+  article chat to a real persistent agent session (see
+  [Article chat](#article-chat)), and serves it all to the app.
 - **App** (`AndroidManifest.xml`, `src/`) — the Android client. No Gradle,
   no Play Services, no third-party dependencies; built with the plain
   Android SDK command-line tools.
@@ -36,9 +37,9 @@ to misreading acronyms like "RCE" or "CVE" as if they were words) or a
 paid cloud API. This app instead runs a real neural TTS model on a
 machine you control, reached over a tunnel you already trust - and
 normalizes text before synthesis so acronyms get spelled out rather than
-mangled. The same pipeline reads agent chat replies aloud as they stream
-in, not after the fact - pauses while it waits for more text to generate
-are fine, but it never sits on a finished sentence before speaking it.
+mangled. The same pipeline reads a finished chat reply aloud on request
+(a "Read aloud" button on each reply), rather than sitting on it before
+speaking it.
 
 ## What "digest" means here
 
@@ -138,6 +139,32 @@ what's worth mentioning). `server/generate-digest.sh.example` shows the
 mechanics - reading across your enabled sources, prompting an LLM for a
 short narrative piece, writing the JSON shape above - with placeholder
 personalization; copy it outside the repo and fill in the real thing.
+
+### Article chat
+
+Asking a question about a digest article talks to a separate daemon (not
+included in this repo - roll your own, or point this at whatever
+equivalent you already run) that owns a real tmux + Claude Code session
+per conversation, over its own HTTP API. This server proxies to it rather
+than running Claude itself, which is what makes a conversation:
+
+- **stateful** - a real interactive session, not one throwaway process
+  per message;
+- **resilient to a dropped/roaming phone connection** - every call
+  (spawn/send/poll) is a stateless, idempotent HTTP request, so a retry
+  after a drop is indistinguishable from the first attempt;
+- **persistent** - the session id is written into the digest's own JSON
+  file (`feed.py`'s `get_chat_session`/`set_chat_session`), so reopening
+  the same article days later resumes the same conversation, and the
+  session is a real one you can `claude --resume <id>` from any other
+  tmux pane on the machine.
+
+Point this server at your daemon with `NEWSDIGEST_CLAUDE_AGENTS_URL`
+(defaults to `http://127.0.0.1:8790`, i.e. same-host) and make sure this
+server's user can read that daemon's pairing token file
+(`~/.config/claude-agents/token` by default). Without it, everything
+else in this app (feeds, digests, read-aloud) still works fine - chat
+just returns an error.
 
 ### App
 
