@@ -12,14 +12,21 @@ extracted from every [label](url) link in it, so the app can render an
 Expects the LLM's raw output on stdin split into topic sections marked
 like:
     ===TOPIC: Programming & Your Tools===
+    ===CATEGORY: Programming===
     <markdown for this topic>
     ===TOPIC: Job Search===
+    ===CATEGORY: Career===
     <markdown for this topic>
 
+The CATEGORY line is optional (a run that produced it in an older format,
+or skipped it, still parses - it just comes back empty) - topic is the
+specific, today-only title; category is the coarse at-a-glance tag the
+app badges each entry with.
+
 Writes ~/.cache/newsdigest-server/digest/<date>.json (and updates
-latest.json) as {"date": ..., "digests": [{"topic", "markdown",
-"references"}, ...]}, then applies a retention curve: daily for 2 weeks,
-thinned to weekly through day 44, dropped after that.
+latest.json) as {"date": ..., "digests": [{"topic", "category",
+"markdown", "references"}, ...]}, then applies a retention curve: daily
+for 2 weeks, thinned to weekly through day 44, dropped after that.
 
 Generic and reusable across whatever sources are actually enabled -
 builds its link index from feed.py's already-merged items (respecting
@@ -36,6 +43,7 @@ import feed
 
 LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 TOPIC_RE = re.compile(r"^===TOPIC:\s*(.+?)\s*===\s*$", re.MULTILINE)
+CATEGORY_RE = re.compile(r"\A===CATEGORY:\s*(.+?)\s*===\s*\n?")
 
 DAILY_TIER_DAYS = 14
 WEEKLY_TIER_DAYS = 44
@@ -64,23 +72,34 @@ def extract_references(markdown: str, link_index: dict) -> list:
     return refs
 
 
-def parse_topics(raw: str) -> list[tuple[str, str]]:
-    """Splits on ===TOPIC: name=== markers into (topic, markdown) pairs.
-    A generator that ignored the marker format entirely (no markers found)
-    still produces one nameless topic rather than losing the output."""
+def parse_topics(raw: str) -> list[tuple[str, str, str]]:
+    """Splits on ===TOPIC: name=== markers into (topic, category, markdown)
+    triples, pulling an optional immediately-following ===CATEGORY: ...===
+    line out of each body. A generator that ignored the marker format
+    entirely (no TOPIC markers found) still produces one nameless topic
+    rather than losing the output; one that skipped the CATEGORY line
+    just gets an empty category, not a parse failure."""
     matches = list(TOPIC_RE.finditer(raw))
     if not matches:
         stripped = raw.strip()
-        return [("Today", stripped)] if stripped else []
+        return [("Today", "", stripped)] if stripped else []
 
     sections = []
     for i, m in enumerate(matches):
         topic = m.group(1).strip()
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
-        body = raw[start:end].strip()
+        body = raw[start:end].lstrip("\n")
+
+        category = ""
+        cat_match = CATEGORY_RE.match(body)
+        if cat_match:
+            category = cat_match.group(1).strip()
+            body = body[cat_match.end():]
+
+        body = body.strip()
         if body:
-            sections.append((topic, body))
+            sections.append((topic, category, body))
     return sections
 
 
@@ -118,8 +137,13 @@ def main():
     feed.DIGEST_DIR.mkdir(parents=True, exist_ok=True)
     link_index = load_link_index()
     digests = [
-        {"topic": topic, "markdown": markdown, "references": extract_references(markdown, link_index)}
-        for topic, markdown in topics
+        {
+            "topic": topic,
+            "category": category,
+            "markdown": markdown,
+            "references": extract_references(markdown, link_index),
+        }
+        for topic, category, markdown in topics
     ]
     today_str = date.today().isoformat()
     payload = {"date": today_str, "digests": digests}

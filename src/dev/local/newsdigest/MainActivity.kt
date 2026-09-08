@@ -30,7 +30,7 @@ private const val TAG = "NewsDigest"
  * screen lists - individual source items are deliberately not shown here
  * (there's a separate app for reading raw articles); a digest's own
  * markdown links are still how you reach one. */
-data class DigestEntry(val date: String, val topic: String, val markdown: String, val references: JSONArray)
+data class DigestEntry(val date: String, val topic: String, val category: String, val markdown: String, val references: JSONArray)
 
 class MainActivity : Activity() {
 
@@ -221,6 +221,7 @@ class MainActivity : Activity() {
                 out.add(DigestEntry(
                     date = date,
                     topic = d.optString("topic").ifBlank { "Today" },
+                    category = d.optString("category"),
                     markdown = d.getString("markdown"),
                     references = d.optJSONArray("references") ?: JSONArray(),
                 ))
@@ -268,13 +269,29 @@ class MainActivity : Activity() {
             }
 
             val sourceCount = entry.references.length()
-            val badge = TextView(this@MainActivity).apply {
+            val sourceBadge = TextView(this@MainActivity).apply {
                 text = if (sourceCount == 1) "1 SOURCE" else "$sourceCount SOURCES"
                 textSize = 10f
                 setTextColor(Theme.onPrimary)
                 background = Theme.roundedDrawable(Theme.primary, this@MainActivity, radiusDp = 4)
                 setPadding(Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2), Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2))
             }
+            // Separate badge, separate color from the source-count one -
+            // category is a coarse at-a-glance tag (see build_digest_json.py),
+            // the topic itself (below, as the title) is the specific one.
+            val badgeRow = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+            if (entry.category.isNotBlank()) {
+                val categoryBadge = TextView(this@MainActivity).apply {
+                    text = entry.category.uppercase()
+                    textSize = 10f
+                    setTextColor(Theme.onBackground)
+                    background = Theme.roundedDrawable(Theme.colorForCategory(entry.category), this@MainActivity, radiusDp = 4)
+                    setPadding(Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2), Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2))
+                }
+                badgeRow.addView(categoryBadge)
+                badgeRow.addView(TextView(this@MainActivity).apply { setPadding(Theme.dp(this@MainActivity, 6), 0, 0, 0) }) // spacer
+            }
+            badgeRow.addView(sourceBadge)
             val title = TextView(this@MainActivity).apply {
                 text = (if (isSelected) "✓ " else "") + entry.topic
                 textSize = 16f
@@ -295,7 +312,7 @@ class MainActivity : Activity() {
                 maxLines = 2
             }
 
-            container.addView(badge, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            container.addView(badgeRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             container.addView(title)
             container.addView(subtitle)
             container.addView(snippet)

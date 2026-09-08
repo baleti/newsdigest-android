@@ -45,11 +45,15 @@ into a topic it doesn't belong in just to fill one out, and don't create
 a topic for one throwaway item - fold stragglers into the closest
 reasonable topic or a general one.
 
-First, write ONE overview topic named "Overview" that briefly touches the
-single most interesting thing from EVERY topic below in a few sentences
-each - this is the one you read when you only have a minute and want the
-headlines across everything, not the deep dive. Then write each of the
-detailed topics.
+First, write ONE overview covering the whole day across every topic
+below - this is the main, thorough read, not a teaser: aim for roughly
+1,800-3,000 words, enough to read aloud in about 10 to 20 minutes at a
+natural pace. Go into real detail within it on each topic - actual
+narrative substance and the connections between items, the way the
+detailed topics below do - not a single highlight sentence each. Give it
+a genuinely descriptive title of its own (like a newsletter issue
+headline capturing what actually stood out today), not just the word
+"Overview". Then write each of the detailed topics.
 
 Write EACH detailed topic as its own short piece of narrative writing -
 like an entry in a personal newsletter written directly to you, not a
@@ -57,7 +61,17 @@ bulleted report. Within a topic, let one item flow into the next with
 real transitions, the way someone telling you about their day would,
 rather than restarting structure for each item. A few paragraphs per
 topic is plenty; a topic with only one or two items can be a single
-short paragraph.
+short paragraph. These are meant to be quicker, narrower reads than the
+overview - someone who only cares about one area reaches for these
+instead of the whole thing.
+
+For every topic including the overview, also pick one short, broad
+category label - a couple of words at most (e.g. "Architecture",
+"Programming", "Career", "Security", "Science") - that classifies what
+kind of topic it is at a glance. The overview's category can be
+something like "Overview" or "Daily Summary" itself. This is separate
+from the topic's own descriptive title - the category is a coarse
+at-a-glance tag, the title is specific to today's actual content.
 
 Every story or item you mention by name must carry a markdown link
 [label](url) to its original link field, when it has one - never mention
@@ -67,18 +81,23 @@ using its feed_title field - not only via the link - since someone
 reading this aloud through text-to-speech never sees a URL or its domain.
 
 Output format - this is machine-parsed, follow it exactly: separate each
-topic with a line reading exactly "===TOPIC: <short topic name>===" (no
-markdown formatting on that line itself), followed by that topic's
-narrative, starting with "===TOPIC: Overview===". Nothing else outside
-that structure - no preamble, no overall title, no meta-commentary. Your
-entire response is saved verbatim and split on those markers.
+topic with a line reading exactly "===TOPIC: <descriptive topic
+title>===" immediately followed by a line reading exactly "===CATEGORY:
+<short category label>===" (no markdown formatting on either line),
+then that topic's narrative. The overview goes first. Nothing else
+outside that structure - no preamble, no overall title, no
+meta-commentary. Your entire response is saved verbatim and split on
+those markers.
 
 Example shape (not real content):
-===TOPIC: Overview===
-<brief narrative touching every topic below>
-===TOPIC: Job Search===
+===TOPIC: A Quiet Day Except For Two Big Commits===
+===CATEGORY: Overview===
+<the long, detailed overview narrative touching every topic below>
+===TOPIC: Three Recruiters Went Quiet This Week===
+===CATEGORY: Career===
 <narrative for this topic>
-===TOPIC: Programming===
+===TOPIC: Claude Code Ships Worktree Support===
+===CATEGORY: Programming===
 <narrative for this topic>
 PROMPT
 )" > "$TMP"
