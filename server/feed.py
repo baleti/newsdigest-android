@@ -15,6 +15,7 @@ config change, never a code change here.
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
@@ -108,6 +109,58 @@ def favicon_file(host: str) -> tuple[Path, str] | None:
         if p.exists():
             return p, mime
     return None
+
+
+_chat_session_lock = threading.Lock()
+
+
+def _run_digest_path(run_id: str) -> Path | None:
+    # run_id comes straight from a client-supplied query param - restrict
+    # it to the exact shape build_digest_json.py produces before it ever
+    # touches a filesystem path (no "latest", no traversal).
+    if not re.match(r"^\d{4}-\d{2}-\d{2}-\d{2}$", run_id):
+        return None
+    return DIGEST_DIR / f"{run_id}.json"
+
+
+def get_chat_session(run_id: str, topic: str) -> str | None:
+    """The Claude Agents session id (a real tmux+claude conversation, see
+    claude-agents-daemon.py) already spawned for this digest topic, if the
+    app has chatted about it before - persisted into the run's own dated
+    digest file (not latest.json, whose identity changes out from under a
+    conversation the moment the next scheduled digest run overwrites it)."""
+    p = _run_digest_path(run_id)
+    if p is None or not p.exists():
+        return None
+    try:
+        payload = json.loads(p.read_text())
+    except Exception:
+        return None
+    for d in payload.get("digests", []):
+        if d.get("topic") == topic:
+            return d.get("chat_session_id")
+    return None
+
+
+def set_chat_session(run_id: str, topic: str, session_id: str) -> bool:
+    p = _run_digest_path(run_id)
+    if p is None or not p.exists():
+        return False
+    with _chat_session_lock:
+        try:
+            payload = json.loads(p.read_text())
+        except Exception:
+            return False
+        found = False
+        for d in payload.get("digests", []):
+            if d.get("topic") == topic:
+                d["chat_session_id"] = session_id
+                found = True
+                break
+        if not found:
+            return False
+        p.write_text(json.dumps(payload))
+        return True
 
 
 def latest_digest() -> dict | None:

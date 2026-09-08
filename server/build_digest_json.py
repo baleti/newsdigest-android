@@ -36,7 +36,7 @@ contributed what, or how many topics there end up being.
 import json
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import feed
@@ -109,7 +109,9 @@ def rotate(digest_dir: Path):
         if f.stem == "latest":
             continue
         try:
-            file_date = date.fromisoformat(f.stem)
+            # stem is now "YYYY-MM-DD" or "YYYY-MM-DD-<slot>" (see run_id
+            # in main()) - the date is always the first 10 characters.
+            file_date = date.fromisoformat(f.stem[:10])
         except ValueError:
             continue
         age = (today - file_date).days
@@ -145,10 +147,19 @@ def main():
         }
         for topic, category, markdown in topics
     ]
-    today_str = date.today().isoformat()
-    payload = {"date": today_str, "digests": digests}
+    now = datetime.now()
+    today_str = now.date().isoformat()
+    # Distinguishes the 07:00 and 17:00 runs of the same day (see
+    # newsdigest-digest.timer) so a chat conversation tied to a topic from
+    # the morning run isn't silently orphaned when the evening run
+    # overwrites latest.json with a fresh set of topics - feed.py persists
+    # chat sessions against this run_id's own dated file, not "latest".
+    # "date" itself stays a plain YYYY-MM-DD for on-screen display.
+    slot = "07" if now.hour < 12 else "17"
+    run_id = f"{today_str}-{slot}"
+    payload = {"date": today_str, "run_id": run_id, "digests": digests}
 
-    dated_path = feed.DIGEST_DIR / f"{today_str}.json"
+    dated_path = feed.DIGEST_DIR / f"{run_id}.json"
     dated_path.write_text(json.dumps(payload))
     (feed.DIGEST_DIR / "latest.json").write_text(json.dumps(payload))
     rotate(feed.DIGEST_DIR)

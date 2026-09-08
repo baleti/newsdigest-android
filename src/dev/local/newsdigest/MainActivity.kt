@@ -30,7 +30,14 @@ private const val TAG = "NewsDigest"
  * screen lists - individual source items are deliberately not shown here
  * (there's a separate app for reading raw articles); a digest's own
  * markdown links are still how you reach one. */
-data class DigestEntry(val date: String, val topic: String, val category: String, val markdown: String, val references: JSONArray)
+data class DigestEntry(
+    val date: String,
+    val runId: String,
+    val topic: String,
+    val category: String,
+    val markdown: String,
+    val references: JSONArray,
+)
 
 class MainActivity : Activity() {
 
@@ -174,6 +181,14 @@ class MainActivity : Activity() {
         val intent = Intent(this, DetailActivity::class.java).apply {
             putExtra("type", "digest")
             putExtra("date", chosen[0].date)
+            // A combined entry's synthetic topic string never matches a
+            // real entry in the digest JSON, so server-side chat
+            // persistence (feed.set_chat_session) quietly no-ops for it -
+            // the conversation still works for this session, it just won't
+            // survive reopening the article later. Acceptable: combining
+            // digests is a "read aloud now" flow, not really an "article
+            // I'll come back to chat about" one.
+            putExtra("runId", chosen[0].runId)
             putExtra("topic", combinedTopic)
             putExtra("markdown", combinedMarkdown)
             putExtra("references", combinedRefs.toString())
@@ -215,11 +230,16 @@ class MainActivity : Activity() {
         try {
             val body = JSONObject(ApiClient.get(this, "/feed/digests"))
             val date = body.getString("date")
+            // Absent on a digest generated before this field existed (no
+            // regeneration has happened since) - chat just won't be able to
+            // resume/persist for those stale entries until the next run.
+            val runId = body.optString("run_id", "")
             val digestsArray = body.getJSONArray("digests")
             for (i in 0 until digestsArray.length()) {
                 val d = digestsArray.getJSONObject(i)
                 out.add(DigestEntry(
                     date = date,
+                    runId = runId,
                     topic = d.optString("topic").ifBlank { "Today" },
                     category = d.optString("category"),
                     markdown = d.getString("markdown"),
@@ -236,6 +256,7 @@ class MainActivity : Activity() {
         val intent = Intent(this, DetailActivity::class.java).apply {
             putExtra("type", "digest")
             putExtra("date", entry.date)
+            putExtra("runId", entry.runId)
             putExtra("topic", entry.topic)
             putExtra("markdown", entry.markdown)
             putExtra("references", entry.references.toString())

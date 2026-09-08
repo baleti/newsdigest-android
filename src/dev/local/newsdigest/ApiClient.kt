@@ -22,13 +22,28 @@ object ApiClient {
     // server/server.py's security_middleware). Fine as a fixed constant.
     private const val PEER_AGENT_HEADER = "X-Peer-Agent"
 
-    fun get(context: Context, path: String): String {
+    fun get(context: Context, path: String, readTimeoutMs: Int = TIMEOUT_MS): String {
         val url = URL("http://${Settings.getHost(context)}:${Settings.getTtsPort(context)}$path")
         val conn = url.openConnection() as HttpURLConnection
         conn.requestMethod = "GET"
         conn.connectTimeout = TIMEOUT_MS
-        conn.readTimeout = TIMEOUT_MS
+        conn.readTimeout = readTimeoutMs
         conn.setRequestProperty(PEER_AGENT_HEADER, "1")
+        return readResponse(conn)
+    }
+
+    // Used by the agent-chat endpoints (spawn/send) - small JSON bodies
+    // only, same blocking-off-main-thread contract as get().
+    fun post(context: Context, path: String, jsonBody: String, readTimeoutMs: Int = TIMEOUT_MS): String {
+        val url = URL("http://${Settings.getHost(context)}:${Settings.getTtsPort(context)}$path")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = TIMEOUT_MS
+        conn.readTimeout = readTimeoutMs
+        conn.setRequestProperty(PEER_AGENT_HEADER, "1")
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(jsonBody.toByteArray(StandardCharsets.UTF_8)) }
         return readResponse(conn)
     }
 

@@ -45,12 +45,22 @@ import feed
 from acronyms import expand_acronyms
 from text_clean import markdown_to_speech
 
-CLAUDE_BIN = str(Path.home() / ".local" / "bin" / "claude")
-ACCOUNT_DIRS = {
-    "claude": Path.home() / ".claude",
-    "claude2": Path.home() / ".claude2",
-    "claude3": Path.home() / ".claude3",
-}
+# The article/digest chat feature doesn't run claude itself - it proxies to
+# the claude-agents daemon (~/.config/claude-agents/claude-agents-daemon.py,
+# claude-agents.service), the same WireGuard-only HTTP bridge the Claude
+# Agents Android app talks to. That daemon owns a real tmux+claude
+# interactive session per conversation and already solves everything this
+# feature actually needs: a genuinely stateful conversation (not one
+# subprocess per turn), resilience to a spotty phone connection (every call
+# is a stateless, idempotent, since-cursor'd HTTP request - a dropped
+# request just gets retried, nothing to reconnect or resume), a real
+# session_id/tmux pane other tools on this machine can attach to or
+# `claude --resume`, and durable delivery (a message lands in the live pane
+# if one exists, else queues to disk until it does). Reusing it here beats
+# reimplementing the same tmux-spawn/poll machinery a second time.
+CLAUDE_AGENTS_URL = os.environ.get("NEWSDIGEST_CLAUDE_AGENTS_URL", "http://10.10.0.2:8790")
+CLAUDE_AGENTS_TOKEN_FILE = Path.home() / ".config" / "claude-agents" / "token"
+ALLOWED_AGENT_ACCOUNTS = {"claude", "claude2", "claude3"}
 
 
 def _env_or_fatal(name):
@@ -151,39 +161,6 @@ def estimate_word_timings(sentence: str, duration_s: float) -> list[dict]:
 def float_to_pcm16(samples: np.ndarray) -> bytes:
     clipped = np.clip(samples, -1.0, 1.0)
     return (clipped * 32767.0).astype(np.int16).tobytes()
-
-
-class SentenceBuffer:
-    """Accumulates raw streamed text and yields complete sentences as soon
-    as a sentence-ending boundary is seen, so the caller can start
-    synthesizing sentence N while sentence N+1 is still being generated.
-    Operates on raw (not yet markdown-stripped) text - a period inside a
-    URL or code span can occasionally trigger an early split, accepted as
-    a rare cosmetic edge case in exchange for not having to buffer the
-    entire reply before any audio can start."""
-
-    _BOUNDARY_RE = re.compile(r"[.!?][\"')\]]*\s+")
-
-    def __init__(self):
-        self.buf = ""
-
-    def add(self, delta: str) -> list[str]:
-        self.buf += delta
-        out = []
-        while True:
-            m = self._BOUNDARY_RE.search(self.buf)
-            if not m:
-                break
-            sentence = self.buf[: m.end()].strip()
-            self.buf = self.buf[m.end():]
-            if sentence:
-                out.append(sentence)
-        return out
-
-    def flush(self) -> str | None:
-        remaining = self.buf.strip()
-        self.buf = ""
-        return remaining or None
 
 
 # --------------------------------------------------------------- engines
@@ -378,141 +355,127 @@ async def synthesize_and_send(websocket: WebSocket, engine, sentence: str, voice
     await websocket.send_bytes(float_to_pcm16(samples))
 
 
-@app.websocket("/agent/chat")
-async def agent_chat(websocket: WebSocket):
-    """Drives claude --print --output-format stream-json
-    --include-partial-messages directly as a subprocess per turn - no tmux,
-    no transcript-file polling. Confirmed live (2026-09-05) that the JSONL
-    transcript claude-relay/claude-agents reads for *interactive* sessions
-    only gets new lines in bursts (a several-second gap, then ~10 lines at
-    once), not incrementally during generation - fine for reading a
-    finished reply, useless for starting TTS before the reply is done.
-    --include-partial-messages gives real token-level text_delta events on
-    this process's own stdout instead, which is what actually lets audio
-    start on sentence 1 while the model is still generating sentence 4.
+# ------------------------------------------------------------------ agent
+#
+# Article/digest chat - proxies to the claude-agents daemon rather than
+# running claude itself (see CLAUDE_AGENTS_URL's comment above). Every
+# endpoint here is a stateless, idempotent HTTP call the daemon can satisfy
+# regardless of whether the conversation was started a second ago or three
+# hours ago from a different network - that statelessness is exactly what
+# makes this resilient to a phone roaming on and off WireGuard mid-chat:
+# there is no per-connection state on this server to lose, so a client
+# retry after a drop is indistinguishable from the first attempt.
 
-    One `claude --print` subprocess per turn (not one long-lived process
-    for the whole conversation) - --session-id on the first turn and
-    --resume on every follow-up is what lets this be stateless between
-    turns while still being one continuous conversation server-side.
-    """
-    client_host = websocket.client.host if websocket.client else None
-    if not _security_ok(client_host, websocket.headers):
-        await websocket.close(code=4403)
-        return
-    await websocket.accept()
+def _agents_token() -> str:
+    return CLAUDE_AGENTS_TOKEN_FILE.read_text().strip()
 
-    session_id: str | None = None
+
+def _agents_call(method: str, path: str, body: dict | None = None, timeout: float = 15.0) -> dict:
+    """Blocking (run via run_in_threadpool from async routes below). Talks
+    to claude-agents-daemon.py's own HTTP API - see that file's do_GET/
+    do_POST for the exact shape of every path used here."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        CLAUDE_AGENTS_URL + path,
+        data=data,
+        method=method,
+        headers={"X-Claude-Agents-Token": _agents_token(), "Content-Type": "application/json"},
+    )
     try:
-        while True:
-            req = await websocket.receive_json()
-            cmd = req.get("cmd")
-            text = (req.get("text") or "").strip()
-            engine_name = req.get("engine", "kokoro")
-            voice = req.get("voice")
-            account = req.get("account", "claude2")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"claude-agents {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"claude-agents unreachable: {e.reason}")
 
-            if not text:
-                await websocket.send_json({"type": "error", "message": "empty text"})
-                continue
-            engine = ENGINES.get(engine_name)
-            if engine is None or not engine.ready:
-                await websocket.send_json({"type": "error", "message": f"'{engine_name}' not available"})
-                continue
-            if account not in ACCOUNT_DIRS:
-                await websocket.send_json({"type": "error", "message": f"unknown account '{account}'"})
-                continue
 
-            if cmd == "start":
-                session_id = str(uuid.uuid4())
-                argv = [
-                    CLAUDE_BIN, "--print", "--output-format", "stream-json", "--verbose",
-                    "--include-partial-messages", "--dangerously-skip-permissions",
-                    "--session-id", session_id, text,
-                ]
-            elif cmd == "continue":
-                session_id = req.get("session_id") or session_id
-                if not session_id:
-                    await websocket.send_json({"type": "error", "message": "no active session - send cmd 'start' first"})
-                    continue
-                argv = [
-                    CLAUDE_BIN, "--print", "--output-format", "stream-json", "--verbose",
-                    "--include-partial-messages", "--dangerously-skip-permissions",
-                    "--resume", session_id, text,
-                ]
-            else:
-                await websocket.send_json({"type": "error", "message": f"unknown cmd '{cmd}'"})
-                continue
-
-            await websocket.send_json({"type": "session", "session_id": session_id})
-
-            env = os.environ.copy()
-            env["CLAUDE_CONFIG_DIR"] = str(ACCOUNT_DIRS[account])
-
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=str(Path.home()),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            buf = SentenceBuffer()
-            saw_any_event = False
-            try:
-                async for raw_line in proc.stdout:
-                    line = raw_line.decode("utf-8", "replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    saw_any_event = True
-                    etype = event.get("type")
-                    if etype == "stream_event":
-                        inner = event.get("event", {})
-                        if inner.get("type") == "content_block_delta":
-                            delta = inner.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                piece = delta.get("text", "")
-                                if piece:
-                                    await websocket.send_json({"type": "text_delta", "text": piece})
-                                    for raw_sentence in buf.add(piece):
-                                        cleaned_sentence = markdown_to_speech(raw_sentence).strip()
-                                        if cleaned_sentence:
-                                            await synthesize_and_send(websocket, engine, cleaned_sentence, voice)
-                    elif etype == "result" and event.get("is_error"):
-                        await websocket.send_json({"type": "error", "message": str(event.get("result", "agent error"))})
-
-                await proc.wait()
-
-                if not saw_any_event and proc.returncode != 0:
-                    stderr = (await proc.stderr.read()).decode("utf-8", "replace")[:2000]
-                    await websocket.send_json({"type": "error", "message": f"claude exited {proc.returncode}: {stderr}"})
-
-                remaining = buf.flush()
-                if remaining:
-                    cleaned_remaining = markdown_to_speech(remaining).strip()
-                    if cleaned_remaining:
-                        await synthesize_and_send(websocket, engine, cleaned_remaining, voice)
-
-                await websocket.send_json({"type": "turn_done", "session_id": session_id})
-            finally:
-                if proc.returncode is None:
-                    proc.kill()
-    except WebSocketDisconnect:
-        pass
+@app.get("/agent/session")
+async def agent_session(run_id: str, topic: str):
+    """Does a conversation already exist for this digest topic? If so,
+    return it plus its full message history so the app can resume exactly
+    where it left off (a fresh app launch, a killed activity, a different
+    device even) instead of starting a new one every time chat is opened."""
+    session_id = feed.get_chat_session(run_id, topic)
+    if not session_id:
+        return {"session_id": None, "messages": []}
+    try:
+        resp = await run_in_threadpool(_agents_call, "GET", f"/api/v1/conversations/{session_id}/messages?since=0")
     except Exception as e:
-        try:
-            await websocket.send_json({"type": "error", "message": f"{e.__class__.__name__}: {e}"})
-        except Exception:
-            pass
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        # The session id is still real and still worth returning - just
+        # couldn't fetch history right now (daemon restarting, etc).
+        return {"session_id": session_id, "messages": [], "error": str(e)}
+    return {"session_id": session_id, "messages": resp.get("messages", [])}
+
+
+@app.post("/agent/spawn")
+async def agent_spawn(request: Request):
+    body = await request.json()
+    run_id = (body.get("run_id") or "").strip()
+    topic = (body.get("topic") or "").strip()
+    text = (body.get("text") or "").strip()
+    account = body.get("account", "claude2")
+    if not text:
+        return JSONResponse({"error": "empty text"}, status_code=400)
+    if account not in ALLOWED_AGENT_ACCOUNTS:
+        return JSONResponse({"error": f"unknown account '{account}'"}, status_code=400)
+
+    # A conversation for this exact topic may already have been spawned
+    # (another device, or this one after a restart) - never spawn a second
+    # one out from under it, that would fork the conversation silently.
+    existing = feed.get_chat_session(run_id, topic) if run_id and topic else None
+    if existing:
+        return {"session_id": existing, "resumed": True}
+
+    try:
+        resp = await run_in_threadpool(_agents_call, "POST", "/api/v1/spawn", {"account": account, "text": text}, 25.0)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    session_id = resp.get("session_id")
+    if session_id and run_id and topic:
+        feed.set_chat_session(run_id, topic, session_id)
+    return {"session_id": session_id, "resumed": False}
+
+
+@app.post("/agent/send")
+async def agent_send(request: Request):
+    body = await request.json()
+    session_id = (body.get("session_id") or "").strip()
+    text = (body.get("text") or "").strip()
+    msg_id = body.get("id") or str(uuid.uuid4())
+    if not session_id or not text:
+        return JSONResponse({"error": "session_id and text required"}, status_code=400)
+    try:
+        resp = await run_in_threadpool(
+            _agents_call, "POST", f"/api/v1/conversations/{session_id}/send", {"text": text, "id": msg_id}, 15.0,
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return resp
+
+
+@app.get("/agent/stream")
+async def agent_stream(session_id: str, since: int = 0, timeout: float = 25.0):
+    """Long-poll: the daemon holds the request open (up to `timeout`, capped
+    at 30s server-side) until either new transcript lines exist past
+    `since` or the conversation's busy/idle status flips, whichever first -
+    this is what the client polls in a tight retry loop instead of holding
+    one long-lived connection, so a dropped request just becomes the next
+    poll's problem rather than something to detect and reconnect."""
+    try:
+        resp = await run_in_threadpool(
+            _agents_call, "GET",
+            f"/api/v1/conversations/{session_id}/stream?since={since}&timeout={min(timeout, 30.0)}",
+            None, timeout + 10.0,
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return resp
+
 
 
 if __name__ == "__main__":

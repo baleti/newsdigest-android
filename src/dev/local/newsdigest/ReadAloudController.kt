@@ -12,6 +12,7 @@ import android.text.SpannableStringBuilder
 import android.text.TextPaint
 import android.text.style.BackgroundColorSpan
 import android.text.style.ClickableSpan
+import android.text.style.ForegroundColorSpan
 import android.util.Log
 import android.view.View
 import org.json.JSONObject
@@ -57,6 +58,11 @@ class ReadAloudController(
     // guess before any real data exists - optional, callers that don't
     // care about showing a "still generating..." indicator can leave it out.
     private val onGenerating: (generating: Boolean, estimatedMs: Long) -> Unit = { _, _ -> },
+    // Fires on every real play/pause transition, from ANY trigger - the
+    // in-app controls, the system notification's own button, a seek,
+    // audio-focus loss/gain - not just ones a caller's own button press
+    // caused. Optional - see TtsPlaybackService.HighlightListener.onPlayingChanged.
+    private val onPlayingChanged: (playing: Boolean) -> Unit = {},
 ) {
     private var ttsService: TtsPlaybackService? = null
     private var bound = false
@@ -159,6 +165,12 @@ class ReadAloudController(
             mainHandler.post { onGenerating(true, avgSynthMs) }
         }
 
+        override fun onPlayingChanged(playing: Boolean) {
+            // Qualified: this override and the outer constructor param
+            // share a name, and unqualified would recurse into itself.
+            mainHandler.post { this@ReadAloudController.onPlayingChanged.invoke(playing) }
+        }
+
         override fun onQueueIdle() {
             mainHandler.post {
                 onGenerating(false, 0L)
@@ -176,6 +188,27 @@ class ReadAloudController(
             ttsService = svc
             svc.setListener(highlightListener)
             bound = true
+            // A previous screen (this article, or a different one/the
+            // digest/a chat reply) may have started a session and then
+            // gone away without stopping it -- the service itself, a real
+            // foreground service with its own notification, kept right on
+            // playing in the background exactly as intended (asked for
+            // explicitly: "playback continues even if i close the
+            // activity/window with the conversation"). This fresh
+            // controller's own `active`/caption state starts empty
+            // regardless, so this only resyncs play/pause state for
+            // whatever's listening for it (e.g. the toolbar's Stop/Read
+            // aloud toggle) -- it deliberately does NOT try to restore the
+            // in-place word-highlight caption, since that needs the
+            // original text this screen instance never received.
+            if (svc.hasActiveSession()) {
+                active = true
+                val playingNow = svc.isPlaying()
+                mainHandler.post {
+                    onStateChanged.invoke(true)
+                    onPlayingChanged.invoke(playingNow)
+                }
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -188,8 +221,14 @@ class ReadAloudController(
         context.bindService(Intent(context, TtsPlaybackService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
 
+    /** Detaches this controller from the playback service WITHOUT stopping
+     * playback -- TtsPlaybackService is a real foreground service with its
+     * own MediaSession/notification specifically so a read continues
+     * playing (and stays controllable from the notification/lock screen)
+     * after the launching screen is gone, the same way any other media app
+     * behaves. Call stop() explicitly first (e.g. the toolbar's own Stop
+     * action already does) if leaving really should end the read. */
     fun unbind() {
-        stop()
         if (bound) {
             try { context.unbindService(connection) } catch (_: Exception) {}
             bound = false
@@ -213,14 +252,18 @@ class ReadAloudController(
         knownWords.clear()
         captionBuilder.clear()
         captionBuilder.append(text) // shown in full immediately - reading only ever highlights within this, never replaces it
-        // Drop any real link ClickableSpans that came along for the ride
-        // (append() copies spans from a Spanned source) - during reading
-        // every tap should mean "seek here", never "open this link", and
-        // an overlapping real-link span would otherwise contend with the
-        // per-word one attachWordSpans() is about to add for the same
-        // range. Bold styling (StyleSpan, not clickable) is unaffected.
+        // Swap real link ClickableSpans (copied in by append() from a
+        // Spanned source) for plain blue coloring over the same range -
+        // during reading every tap should mean "seek here", never "open
+        // this link" (an overlapping real-link span would otherwise
+        // contend with the per-word one attachWordSpans() is about to
+        // add), but the blue is worth keeping as a "this was a link"
+        // reference. Bold styling (StyleSpan, not clickable) is unaffected.
         for (span in captionBuilder.getSpans(0, captionBuilder.length, ClickableSpan::class.java)) {
+            val start = captionBuilder.getSpanStart(span)
+            val end = captionBuilder.getSpanEnd(span)
             captionBuilder.removeSpan(span)
+            captionBuilder.setSpan(ForegroundColorSpan(Theme.linkColor), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
         attachWordSpans(fullText)
         searchCursor = 0
@@ -244,6 +287,18 @@ class ReadAloudController(
             onStateChanged.invoke(false)
             return
         }
+        // Explicitly START the service, not just bind it -- confirmed live
+        // (2026-09-08, in claude-agents-android's copy of this same code)
+        // that a bind-only service is destroyed the instant its last
+        // client unbinds, REGARDLESS of startForeground() having already
+        // been called: startForeground() elevates process priority/shows
+        // the notification while the service is alive, but it does not by
+        // itself keep the component's lifecycle independent of bindings.
+        // Without this, "playback continues even if i close the activity"
+        // silently did nothing -- the notification and service both
+        // vanished the moment the launching screen's onDestroy() ran
+        // unbind(), even with the stop() call already removed from it.
+        context.startForegroundService(Intent(context, TtsPlaybackService::class.java))
         svc.startSession(title)
         svc.setPlaybackSpeed(currentSpeed)
         streamText(fullText, svc)
@@ -392,6 +447,17 @@ class ReadAloudController(
 
     fun pause() = ttsService?.pause()
     fun resume() = ttsService?.resume()
+
+    /** Skip back/forward by deltaMs (negative to rewind) from the current
+     * position - clamps into whatever's been synthesized so far, same as
+     * seekTo() itself; a forward skip that runs past that just lands at
+     * the end of what's available rather than skipping ahead into
+     * unsynthesized text (that's what tapping a specific word further
+     * ahead is for - see skipAheadTo()). */
+    fun seekRelative(deltaMs: Long) {
+        val svc = ttsService ?: return
+        svc.seekTo((svc.getPositionMs() + deltaMs).coerceAtLeast(0))
+    }
 
     /** Remembered for the next start() too, not just applied live - so
      * picking a speed sticks across separate read-aloud sessions instead

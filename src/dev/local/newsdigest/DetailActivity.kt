@@ -9,6 +9,7 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.os.IBinder
 import android.text.method.LinkMovementMethod
+import android.util.Log
 import android.view.Gravity
 import android.view.Menu
 import android.view.MenuItem
@@ -20,6 +21,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Content view (digest or item) + read-aloud-with-highlighting + a sticky
@@ -40,7 +42,9 @@ class DetailActivity : Activity() {
     private lateinit var subtitleView: TextView
     private lateinit var contentView: TextView
     private lateinit var synthBanner: SynthesizingBanner
+    private lateinit var playerBar: PlayerControlBar
     private var readAloudMenuItem: MenuItem? = null
+    private var isPlaying = false
     private lateinit var chatContainer: LinearLayout
     private lateinit var inputField: EditText
     private lateinit var scrollView: ScrollView
@@ -50,13 +54,15 @@ class DetailActivity : Activity() {
     private var chatTtsBound = false
 
     private var agentChat: AgentChatClient? = null
-    private var chatSessionId: String? = null
+    private var chatBusyRow: LinearLayout? = null
 
     private var sourceTitle: String = ""
     private var sourceLink: String = ""
     private var contentForChat: String = ""
     private var rawContent: String = ""
     private var isDigest = false
+    private var digestRunId: String = ""
+    private var digestTopic: String = ""
 
     private val chatConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -85,6 +91,10 @@ class DetailActivity : Activity() {
                 readAloudMenuItem?.title = if (playing) "Stop" else "Read aloud"
                 window.decorView.post { invalidateOptionsMenu() }
                 if (playing) {
+                    isPlaying = true
+                    playerBar.show()
+                    playerBar.setPlaying(true)
+                    playerBar.setSpeed(readAloud.getSpeed())
                     // The plain caption has no real hyperlinks of its own
                     // (see ReadAloudController's docstring) - the only
                     // ClickableSpans in it are the per-word seek targets
@@ -92,6 +102,7 @@ class DetailActivity : Activity() {
                     // and is what lets tapping a word actually seek.
                     contentView.movementMethod = LinkMovementMethod.getInstance()
                 } else {
+                    playerBar.hide()
                     // Restore the rich static view whenever playback
                     // stops - whether the user stopped it or it finished
                     // on its own reaching the end (onStateChanged fires
@@ -109,6 +120,10 @@ class DetailActivity : Activity() {
             },
             onGenerating = { generating, estimatedMs ->
                 if (generating) synthBanner.start(estimatedMs) else synthBanner.stop()
+            },
+            onPlayingChanged = { playing ->
+                isPlaying = playing
+                playerBar.setPlaying(playing)
             },
         )
         readAloud.bind()
@@ -136,11 +151,11 @@ class DetailActivity : Activity() {
     private fun dp(v: Int) = Theme.dp(this, v)
 
     // Sticky in the top bar (survives scrolling) rather than a button
-    // inside the scrolling content, per feedback.
+    // inside the scrolling content, per feedback. Speed used to live here
+    // too (behind "..."), but now has its own icon in playerBar instead.
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
         readAloudMenuItem = menu?.add(0, 1, 0, if (readAloud.isActive()) "Stop" else "Read aloud")
         readAloudMenuItem?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
-        SpeedMenu.addTo(menu, readAloud.getSpeed())
         return true
     }
 
@@ -149,7 +164,6 @@ class DetailActivity : Activity() {
             toggleReadAloud()
             return true
         }
-        if (SpeedMenu.handle(item, readAloud)) return true
         return super.onOptionsItemSelected(item)
     }
 
@@ -158,6 +172,20 @@ class DetailActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Theme.bg)
         }
+
+        playerBar = PlayerControlBar(
+            this,
+            onRewind = { readAloud.seekRelative(-15_000) },
+            onPlayPause = { if (isPlaying) readAloud.pause() else readAloud.resume() },
+            onForward = { readAloud.seekRelative(15_000) },
+            onSpeedClick = { anchor ->
+                SpeedPicker.show(this, anchor, readAloud.getSpeed()) { speed ->
+                    readAloud.setSpeed(speed)
+                    playerBar.setSpeed(speed)
+                }
+            },
+        )
+        outer.addView(playerBar.view)
 
         synthBanner = SynthesizingBanner(this)
         outer.addView(synthBanner.view) // above the ScrollView, not inside it - stays visible regardless of scroll position
@@ -227,9 +255,12 @@ class DetailActivity : Activity() {
 
     private fun loadDigest() {
         val date = intent.getStringExtra("date") ?: ""
+        val runId = intent.getStringExtra("runId") ?: ""
         val topic = intent.getStringExtra("topic") ?: "Today"
         val markdown = intent.getStringExtra("markdown") ?: ""
         isDigest = true
+        digestRunId = runId
+        digestTopic = topic
         titleView.text = topic
         subtitleView.text = date
         rawContent = markdown
@@ -237,6 +268,14 @@ class DetailActivity : Activity() {
         sourceTitle = "$topic ($date)"
         sourceLink = ""
         contentView.text = MarkdownRenderer.render(markdown) { url -> openArticle(url) }
+
+        // Was this article already chatted about (this session, an earlier
+        // one, even another device)? The conversation is persisted
+        // server-side against this exact digest run + topic - resume it
+        // rather than starting a new one every time the article is opened.
+        if (runId.isNotBlank()) {
+            ensureAgentChat().resume(runId, topic)
+        }
     }
 
     private fun loadItem() {
@@ -298,7 +337,7 @@ class DetailActivity : Activity() {
 
     // ------------------------------------------------------------ chat
 
-    private fun addChatBubble(role: String, initialText: String): TextView {
+    private fun addChatBubble(role: String, text: String) {
         val isUser = role == "You"
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -311,21 +350,71 @@ class DetailActivity : Activity() {
 
         wrapper.addView(
             TextView(this).apply {
-                text = role
+                this.text = role
                 textSize = 11f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(if (isUser) Theme.primary else Theme.linkColor)
             },
         )
-        val body = TextView(this).apply {
-            text = initialText
-            textSize = 14f
-            setTextColor(Theme.onBackground)
-            setPadding(0, dp(4), 0, 0)
+        wrapper.addView(
+            TextView(this).apply {
+                this.text = text
+                textSize = 14f
+                setTextColor(Theme.onBackground)
+                setPadding(0, dp(4), 0, 0)
+            },
+        )
+        if (!isUser) {
+            val readBtn = Button(this).apply {
+                this.text = "Read aloud"
+                setTextColor(Theme.onBackground)
+                Theme.styleGhostButton(this, this@DetailActivity)
+                setOnClickListener { speakChatReply(text) }
+            }
+            val readBtnRow = LinearLayout(this).apply { setPadding(0, dp(6), 0, 0) }
+            readBtnRow.addView(readBtn)
+            wrapper.addView(readBtnRow)
         }
-        wrapper.addView(body)
         chatContainer.addView(row)
-        return body
+    }
+
+    private fun showChatBusy(busy: Boolean) {
+        chatBusyRow?.let { chatContainer.removeView(it) }
+        chatBusyRow = null
+        if (busy) {
+            val row = LinearLayout(this).apply {
+                setPadding(dp(14), dp(6), dp(14), dp(10))
+                addView(
+                    TextView(this@DetailActivity).apply {
+                        text = "Claude is working…"
+                        textSize = 12f
+                        setTextColor(Theme.onSurfaceVariant)
+                    },
+                )
+            }
+            chatContainer.addView(row)
+            chatBusyRow = row
+        }
+        scrollToBottom()
+    }
+
+    /** One AgentChatClient per Activity instance, created lazily so
+     * loadDigest()'s resume() call and the first onSend() share the same
+     * live conversation/poll loop instead of each spawning their own. */
+    private fun ensureAgentChat(): AgentChatClient {
+        agentChat?.let { return it }
+        val client = AgentChatClient(
+            this,
+            onSessionReady = { _, resumed -> if (!resumed) Log.i("NewsDigest", "chat: spawned new session") },
+            onMessages = { messages ->
+                for (m in messages) addChatBubble(if (m.role == "user") "You" else "Assistant", m.text)
+                scrollToBottom()
+            },
+            onBusyChanged = { busy -> showChatBusy(busy) },
+            onError = { message -> Toast.makeText(this, "Chat error: $message", Toast.LENGTH_LONG).show() },
+        )
+        agentChat = client
+        return client
     }
 
     private fun onSend() {
@@ -334,84 +423,86 @@ class DetailActivity : Activity() {
         inputField.text.clear()
 
         addChatBubble("You", question)
-        val assistantBubble = addChatBubble("Assistant", "…")
         scrollToBottom()
 
-        val turnSentences = mutableListOf<CachedSentence>()
-        var autoForward = false
-        var receivedFirstDelta = false
-        var turnFinished = false
-
-        val readBtn = Button(this).apply {
-            text = "Read aloud"
-            isEnabled = false
-            setTextColor(Theme.onBackground)
-            Theme.styleGhostButton(this, this@DetailActivity)
-        }
-        val readBtnRow = LinearLayout(this).apply { setPadding(0, 0, 0, dp(10)) }
-        readBtnRow.addView(readBtn)
-        chatContainer.addView(readBtnRow)
-        readBtn.setOnClickListener {
-            readAloud.stop()
-            autoForward = true
-            chatTtsService?.let { svc ->
-                svc.stopAll()
-                svc.setListener(object : TtsPlaybackService.HighlightListener {})
-                svc.startSession(sourceTitle)
-                for (s in turnSentences) svc.enqueueSentence(s.text, s.words, s.pcm, s.sampleRate)
-                // If the reply had already finished streaming before this
-                // button was tapped, no further onSentenceReady calls will
-                // ever arrive to trigger endSession() below - say so now,
-                // or the service waits forever for sentences that aren't
-                // coming and the queue never reports idle once this plays out.
-                if (turnFinished) svc.endSession()
-            }
-        }
-
-        val client = AgentChatClient(
-            this,
-            onSessionId = { sid -> chatSessionId = sid },
-            onTextDelta = { delta ->
-                if (!receivedFirstDelta) {
-                    receivedFirstDelta = true
-                    assistantBubble.text = delta
-                } else {
-                    assistantBubble.append(delta)
-                }
-                scrollToBottom()
-            },
-            onSentenceReady = { sentence ->
-                turnSentences.add(sentence)
-                readBtn.isEnabled = true
-                if (autoForward) {
-                    chatTtsService?.enqueueSentence(sentence.text, sentence.words, sentence.pcm, sentence.sampleRate)
-                }
-            },
-            onTurnDone = {
-                turnFinished = true
-                // Only meaningful once autoForward is true (read-aloud was
-                // engaged for this turn); harmless no-op otherwise since
-                // startSession() resets sessionEnded per-session anyway.
-                if (autoForward) chatTtsService?.endSession()
-            },
-            onError = { message ->
-                assistantBubble.text = "Error: $message"
-                Toast.makeText(this, "Chat error: $message", Toast.LENGTH_LONG).show()
-            },
-        )
-        agentChat = client
-
-        val sid = chatSessionId
-        if (sid == null) {
+        val client = ensureAgentChat()
+        if (client.sessionId == null) {
             val prompt = buildString {
                 append(contentForChat)
                 if (sourceLink.isNotBlank()) append("\n\nSource link: $sourceLink")
                 append("\n\nQuestion: $question")
             }
-            client.start(prompt)
+            client.start(digestRunId, digestTopic, prompt)
         } else {
-            client.continueChat(sid, question)
+            client.send(question)
         }
+    }
+
+    /** Reuses /tts/stream directly (the same protocol ReadAloudController
+     * drives for the main article) rather than the old per-delta synth
+     * that used to ride along inside /agent/chat's WebSocket - chat
+     * replies now arrive as one finished block of text from the poll loop
+     * rather than token-by-token, so there is nothing left to synthesize
+     * incrementally as it streams. */
+    private fun speakChatReply(text: String) {
+        if (!chatTtsBound) return
+        val svc = chatTtsService ?: return
+        readAloud.stop()
+        svc.stopAll()
+        svc.setListener(object : TtsPlaybackService.HighlightListener {})
+        // See ReadAloudController.start()'s comment -- a chat-reply read
+        // shares the same TtsPlaybackService instance, and needs the same
+        // explicit start to survive leaving this screen (this is in fact
+        // the exact "close the activity/window with the conversation"
+        // case the fix was asked for).
+        startForegroundService(Intent(this, TtsPlaybackService::class.java))
+        svc.startSession(sourceTitle)
+        Thread {
+            val ws = WebSocketClient(Settings.getHost(this), Settings.getTtsPort(this), "/tts/stream", mapOf("X-Peer-Agent" to "1"))
+            ws.connect(
+                object : WebSocketClient.Listener {
+                    private var pendingMeta: JSONObject? = null
+
+                    override fun onOpen() {
+                        ws.sendText(
+                            JSONObject().apply {
+                                put("text", text)
+                                put("engine", Settings.getTtsEngine(this@DetailActivity))
+                            }.toString(),
+                        )
+                    }
+
+                    override fun onText(msg: String) {
+                        val obj = JSONObject(msg)
+                        when (obj.optString("type")) {
+                            "sentence" -> pendingMeta = obj
+                            "done" -> {
+                                svc.endSession()
+                                ws.close()
+                            }
+                            "error" -> {
+                                runOnUiThread { Toast.makeText(this@DetailActivity, "Read aloud failed: ${obj.optString("message")}", Toast.LENGTH_LONG).show() }
+                                ws.close()
+                            }
+                        }
+                    }
+
+                    override fun onBinary(data: ByteArray) {
+                        val meta = pendingMeta ?: return
+                        val words = mutableListOf<WordTiming>()
+                        meta.optJSONArray("words")?.let { arr ->
+                            for (i in 0 until arr.length()) {
+                                val w = arr.getJSONObject(i)
+                                words.add(WordTiming(w.getString("word"), w.getInt("start_ms"), w.getInt("end_ms")))
+                            }
+                        }
+                        svc.enqueueSentence(meta.getString("text"), words, data, meta.getInt("sample_rate"))
+                    }
+
+                    override fun onFailure(error: Throwable) {}
+                },
+            )
+        }.apply { isDaemon = true; name = "ChatReplyTts"; start() }
     }
 
     private fun scrollToBottom() {
