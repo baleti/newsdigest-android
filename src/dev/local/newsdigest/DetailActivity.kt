@@ -39,7 +39,7 @@ class DetailActivity : Activity() {
     private lateinit var titleView: TextView
     private lateinit var subtitleView: TextView
     private lateinit var contentView: TextView
-    private lateinit var generatingView: TextView
+    private lateinit var synthBanner: SynthesizingBanner
     private var readAloudMenuItem: MenuItem? = null
     private lateinit var chatContainer: LinearLayout
     private lateinit var inputField: EditText
@@ -107,11 +107,8 @@ class DetailActivity : Activity() {
             onCaptionChanged = { caption ->
                 if (readAloud.isActive()) contentView.text = caption
             },
-            onGenerating = { generating ->
-                // Chatterbox especially can take 5-15s per sentence -
-                // without this, a gap between sentences reads as the app
-                // having frozen rather than still working (confirmed live).
-                generatingView.visibility = if (generating) View.VISIBLE else View.GONE
+            onGenerating = { generating, estimatedMs ->
+                if (generating) synthBanner.start(estimatedMs) else synthBanner.stop()
             },
         )
         readAloud.bind()
@@ -162,6 +159,9 @@ class DetailActivity : Activity() {
             setBackgroundColor(Theme.bg)
         }
 
+        synthBanner = SynthesizingBanner(this)
+        outer.addView(synthBanner.view) // above the ScrollView, not inside it - stays visible regardless of scroll position
+
         scrollView = ScrollView(this).apply { setBackgroundColor(Theme.bg) }
         contentContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -187,18 +187,9 @@ class DetailActivity : Activity() {
             movementMethod = LinkMovementMethod.getInstance()
             setLinkTextColor(Theme.linkColor)
         }
-        generatingView = TextView(this).apply {
-            text = "Still generating the next part…"
-            textSize = 12f
-            setTextColor(Theme.muted)
-            setPadding(0, dp(10), 0, 0)
-            visibility = View.GONE
-        }
-
         contentContainer.addView(titleView)
         contentContainer.addView(subtitleView)
         contentContainer.addView(contentView)
-        contentContainer.addView(generatingView)
         contentContainer.addView(spacer(28))
         chatContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         contentContainer.addView(chatContainer)
@@ -290,7 +281,18 @@ class DetailActivity : Activity() {
             }
         } else {
             chatTtsService?.stopAll()
-            readAloud.start(sourceTitle, rawContent)
+            // Pass the RENDERED text, not raw markdown - see
+            // ReadAloudController.start()'s doc: this keeps the caption's
+            // plain-text form identical to what the server actually
+            // strips down to and times, so highlighting/tap-to-seek stay
+            // in sync for sentences containing links, bold, etc. instead
+            // of silently failing to match (confirmed live before this fix).
+            val renderedText = if (isDigest) {
+                MarkdownRenderer.render(rawContent) { url -> openArticle(url) }
+            } else {
+                rawContent
+            }
+            readAloud.start(sourceTitle, renderedText)
         }
     }
 

@@ -16,6 +16,11 @@ import android.util.Log
 import android.view.View
 import org.json.JSONObject
 
+// Generic fallback before any real synth_ms data exists at all - start()
+// replaces this with an engine-aware guess (Chatterbox's diffusion
+// sampler is far slower than Kokoro) the moment it knows which engine.
+private const val DEFAULT_ESTIMATE_MS = 4000L
+
 /**
  * Wires a WebSocketClient (against /tts/stream) to TtsPlaybackService and
  * highlights words in place over the full text as it's read - the content
@@ -40,14 +45,18 @@ class ReadAloudController(
     private val context: Context,
     private val onStateChanged: (playing: Boolean) -> Unit,
     private val onCaptionChanged: (CharSequence) -> Unit,
-    // Fires true right after a sentence finishes playing and there's
-    // nothing queued yet to follow it, false once the next one actually
-    // starts. Chatterbox in particular can take 5-15s to synthesize a
-    // sentence - streaming means that gap is expected (see server.py's
-    // docs), but with no visual cue it reads as the app having frozen
-    // rather than still working. Optional - callers that don't care about
-    // showing a "still generating..." indicator can just leave it out.
-    private val onGenerating: (Boolean) -> Unit = {},
+    // Fires true (with a live best-guess of how many ms the wait will be)
+    // right when start() is called and again after a sentence finishes
+    // playing with nothing queued yet to follow it; false once the next
+    // one actually starts. Chatterbox in particular can take 5-15s to
+    // synthesize a sentence - streaming means that gap is expected (see
+    // server.py's docs), but with no visual cue it reads as the app
+    // having frozen rather than still working. The estimate is a rolling
+    // average of this session's own observed synth_ms per sentence (see
+    // server.py's synthesize_and_send), seeded with a generic per-engine
+    // guess before any real data exists - optional, callers that don't
+    // care about showing a "still generating..." indicator can leave it out.
+    private val onGenerating: (generating: Boolean, estimatedMs: Long) -> Unit = { _, _ -> },
 ) {
     private var ttsService: TtsPlaybackService? = null
     private var bound = false
@@ -80,12 +89,27 @@ class ReadAloudController(
     private data class KnownWord(val charStart: Int, val charEnd: Int, val ms: Long)
     private val knownWords = mutableListOf<KnownWord>()
 
+    // Rolling average of synth_ms across this controller's own observed
+    // sentences (kept across separate start() calls in the same activity,
+    // not just within one session - a second read benefits from what the
+    // first one learned about how fast this engine/server currently is).
+    @Volatile private var avgSynthMs: Long = DEFAULT_ESTIMATE_MS
+    private var synthSampleCount = 0
+
+    private fun recordSynthMs(ms: Long) {
+        if (ms <= 0) return
+        synthSampleCount++
+        // Weight recent samples more heavily so the estimate adapts if
+        // the server's pace changes mid-session (e.g. a GPU warming up).
+        avgSynthMs = if (synthSampleCount == 1) ms else (avgSynthMs * 3 + ms) / 4
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val highlightListener = object : TtsPlaybackService.HighlightListener {
         override fun onSentenceStart(text: String, words: List<WordTiming>, startMs: Long) {
             mainHandler.post {
-                onGenerating(false)
+                onGenerating(false, 0L)
                 // Locate this sentence inside the text that's already on
                 // screen rather than appending it - the server's sentence
                 // text is the same string this controller sent it (see
@@ -132,12 +156,12 @@ class ReadAloudController(
         }
 
         override fun onSentenceEnd() {
-            mainHandler.post { onGenerating(true) }
+            mainHandler.post { onGenerating(true, avgSynthMs) }
         }
 
         override fun onQueueIdle() {
             mainHandler.post {
-                onGenerating(false)
+                onGenerating(false, 0L)
                 if (active) {
                     active = false
                     onStateChanged.invoke(false)
@@ -174,20 +198,44 @@ class ReadAloudController(
 
     fun isActive(): Boolean = active
 
-    /** title is what shows in the media notification while this plays. */
-    fun start(title: String, text: String) {
+    /** title is what shows in the media notification while this plays.
+     * `text` can be plain, or a Spannable (e.g. MarkdownRenderer.render()'s
+     * output) whose spans - link clicks, bold styling - carry over into
+     * the live caption automatically (SpannableStringBuilder.append()
+     * copies spans from a Spanned source). Passing the rendered form
+     * instead of raw markdown is what keeps the plain text underneath
+     * identical to what the server actually receives and times, since
+     * markdown_to_speech() on the server strips the exact same
+     * constructs this rendering already stripped - see class doc. */
+    fun start(title: String, text: CharSequence) {
         stop()
-        fullText = text
+        fullText = text.toString()
         knownWords.clear()
         captionBuilder.clear()
         captionBuilder.append(text) // shown in full immediately - reading only ever highlights within this, never replaces it
-        attachWordSpans(text)
+        // Drop any real link ClickableSpans that came along for the ride
+        // (append() copies spans from a Spanned source) - during reading
+        // every tap should mean "seek here", never "open this link", and
+        // an overlapping real-link span would otherwise contend with the
+        // per-word one attachWordSpans() is about to add for the same
+        // range. Bold styling (StyleSpan, not clickable) is unaffected.
+        for (span in captionBuilder.getSpans(0, captionBuilder.length, ClickableSpan::class.java)) {
+            captionBuilder.removeSpan(span)
+        }
+        attachWordSpans(fullText)
         searchCursor = 0
         highlightSpan = null
         active = true
         onStateChanged.invoke(true)
         onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
-        onGenerating(true) // nothing synthesized yet either - same "still working" state as a mid-read gap
+        if (synthSampleCount == 0) {
+            // No real data yet at all (first read this activity has done) -
+            // seed with an engine-aware guess rather than the generic
+            // default, so the very first estimate isn't wildly off for
+            // Chatterbox in particular.
+            avgSynthMs = if (Settings.getTtsEngine(context) == "chatterbox") 10_000L else 2_000L
+        }
+        onGenerating(true, avgSynthMs) // nothing synthesized yet either - same "still working" state as a mid-read gap
 
         val svc = ttsService
         if (svc == null) {
@@ -198,7 +246,7 @@ class ReadAloudController(
         }
         svc.startSession(title)
         svc.setPlaybackSpeed(currentSpeed)
-        streamText(text, svc)
+        streamText(fullText, svc)
     }
 
     /** One ClickableSpan per whitespace-delimited word across the WHOLE
@@ -249,7 +297,7 @@ class ReadAloudController(
         ws?.close() // stop the old stream's remaining sentences from arriving after the new ones
         svc.jumpToUpcoming()
         searchCursor = fullText.length - resumeText.length
-        onGenerating(true)
+        onGenerating(true, avgSynthMs)
         streamText(resumeText, svc)
     }
 
@@ -318,6 +366,7 @@ class ReadAloudController(
                         }
                     }
                     svc.enqueueSentence(meta.getString("text"), words, data, meta.getInt("sample_rate"))
+                    recordSynthMs(meta.optLong("synth_ms", -1))
                 }
 
                 override fun onFailure(error: Throwable) {
@@ -334,7 +383,7 @@ class ReadAloudController(
 
     fun stop() {
         active = false
-        onGenerating(false)
+        onGenerating(false, 0L)
         streamGeneration++ // suppress any late callback from whatever stream this abandons
         ws?.close()
         ws = null

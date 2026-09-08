@@ -3,10 +3,10 @@ package dev.local.newsdigest
 import android.app.Activity
 import android.os.Bundle
 import android.text.Html
+import android.text.method.LinkMovementMethod
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
-import android.view.View
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -18,7 +18,7 @@ class ArticleActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var readAloud: ReadAloudController
     private lateinit var contentView: TextView
-    private var generatingView: TextView? = null
+    private lateinit var synthBanner: SynthesizingBanner
     private var readAloudMenuItem: MenuItem? = null
     private var plainText: String = ""
     private var articleTitle: String = ""
@@ -41,14 +41,18 @@ class ArticleActivity : Activity() {
                 if (!playing) contentView.text = plainText
             },
             onCaptionChanged = { caption -> if (readAloud.isActive()) contentView.text = caption },
-            onGenerating = { generating ->
-                // Chatterbox especially can take 5-15s per sentence -
-                // without this, a gap between sentences reads as the app
-                // having frozen rather than still working (confirmed live).
-                generatingView?.visibility = if (generating) View.VISIBLE else View.GONE
+            onGenerating = { generating, estimatedMs ->
+                if (generating) synthBanner.start(estimatedMs) else synthBanner.stop()
             },
         )
         readAloud.bind()
+
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Theme.bg)
+        }
+        synthBanner = SynthesizingBanner(this)
+        outer.addView(synthBanner.view) // above the ScrollView, not inside it - stays visible regardless of scroll position
 
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -60,7 +64,9 @@ class ArticleActivity : Activity() {
             setTextColor(Theme.onSurfaceVariant)
         }
         root.addView(statusView)
-        setContentView(ScrollView(this).apply { setBackgroundColor(Theme.bg); addView(root) })
+        val scrollView = ScrollView(this).apply { setBackgroundColor(Theme.bg); addView(root) }
+        outer.addView(scrollView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        setContentView(outer)
 
         val link = intent.getStringExtra("link")
         if (link.isNullOrBlank()) {
@@ -118,17 +124,9 @@ class ArticleActivity : Activity() {
                         // Needed for ReadAloudController's per-word seek
                         // spans to actually receive taps - this plain
                         // extracted text has no other links to worry about.
-                        movementMethod = android.text.method.LinkMovementMethod.getInstance()
+                        movementMethod = LinkMovementMethod.getInstance()
                     }
                     root.addView(contentView)
-                    generatingView = TextView(this).apply {
-                        text = "Still generating the next part…"
-                        textSize = 12f
-                        setTextColor(Theme.muted)
-                        setPadding(0, dp(10), 0, 0)
-                        visibility = View.GONE
-                    }
-                    root.addView(generatingView)
                 }
             } catch (e: Exception) {
                 Log.e("NewsDigest", "article load failed", e)
