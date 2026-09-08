@@ -119,6 +119,16 @@ class DetailActivity : Activity() {
             "item" -> loadItem()
             else -> titleView.text = "Unknown entry"
         }
+
+        // Set by MainActivity's "combine selected digests" action - the
+        // whole point of that flow is to start reading immediately, not
+        // land on a screen you still have to press play on. Delayed
+        // slightly since bindService() above is asynchronous even for a
+        // same-process service; toggleReadAloud() would silently no-op
+        // if it fires before onServiceConnected has actually run.
+        if (intent.getBooleanExtra("autoReadAloud", false)) {
+            window.decorView.postDelayed({ if (!readAloud.isActive()) toggleReadAloud() }, 300)
+        }
     }
 
     private fun dp(v: Int) = Theme.dp(this, v)

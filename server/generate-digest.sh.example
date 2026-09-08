@@ -45,13 +45,19 @@ into a topic it doesn't belong in just to fill one out, and don't create
 a topic for one throwaway item - fold stragglers into the closest
 reasonable topic or a general one.
 
-Write EACH topic as its own short piece of narrative writing - like an
-entry in a personal newsletter written directly to you, not a bulleted
-report. Within a topic, let one item flow into the next with real
-transitions, the way someone telling you about their day would, rather
-than restarting structure for each item. A few paragraphs per topic is
-plenty; a topic with only one or two items can be a single short
-paragraph.
+First, write ONE overview topic named "Overview" that briefly touches the
+single most interesting thing from EVERY topic below in a few sentences
+each - this is the one you read when you only have a minute and want the
+headlines across everything, not the deep dive. Then write each of the
+detailed topics.
+
+Write EACH detailed topic as its own short piece of narrative writing -
+like an entry in a personal newsletter written directly to you, not a
+bulleted report. Within a topic, let one item flow into the next with
+real transitions, the way someone telling you about their day would,
+rather than restarting structure for each item. A few paragraphs per
+topic is plenty; a topic with only one or two items can be a single
+short paragraph.
 
 Every story or item you mention by name must carry a markdown link
 [label](url) to its original link field, when it has one - never mention
@@ -63,11 +69,13 @@ reading this aloud through text-to-speech never sees a URL or its domain.
 Output format - this is machine-parsed, follow it exactly: separate each
 topic with a line reading exactly "===TOPIC: <short topic name>===" (no
 markdown formatting on that line itself), followed by that topic's
-narrative. Nothing else outside that structure - no preamble, no overall
-title, no meta-commentary. Your entire response is saved verbatim and
-split on those markers.
+narrative, starting with "===TOPIC: Overview===". Nothing else outside
+that structure - no preamble, no overall title, no meta-commentary. Your
+entire response is saved verbatim and split on those markers.
 
 Example shape (not real content):
+===TOPIC: Overview===
+<brief narrative touching every topic below>
 ===TOPIC: Job Search===
 <narrative for this topic>
 ===TOPIC: Programming===

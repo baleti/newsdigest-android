@@ -43,6 +43,14 @@ class MainActivity : Activity() {
     // bounces straight back to an unconfigured Settings screen.
     private var autoOpenedSettings = false
 
+    // Long-press a digest to start selecting others, then "Read aloud" in
+    // the top bar (shown only in this mode) combines whichever are
+    // selected into one on-the-fly reading session - nothing is saved
+    // server-side, it's just a convenience for reading several back to
+    // back without opening each one.
+    private var selectionMode = false
+    private val selected = mutableSetOf<Int>()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -97,19 +105,82 @@ class MainActivity : Activity() {
         if (entries.isEmpty()) load()
     }
 
+    override fun onBackPressed() {
+        if (selectionMode) {
+            exitSelectionMode()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
     // A single action goes directly in the bar (SHOW_AS_ACTION_ALWAYS) -
-    // no point routing one item through a "..." overflow menu.
+    // no point routing one item through a "..." overflow menu. Swaps to
+    // "Read aloud" while selecting digests to combine.
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
-        menu?.add(0, 1, 0, "Settings")?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        if (selectionMode) {
+            val label = if (selected.size == 1) "Read aloud" else "Read aloud (${selected.size})"
+            menu?.add(0, 2, 0, label)?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        } else {
+            menu?.add(0, 1, 0, "Settings")?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        }
         return true
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == 1) {
-            startActivity(Intent(this, SettingsActivity::class.java))
-            return true
+        when (item.itemId) {
+            1 -> {
+                startActivity(Intent(this, SettingsActivity::class.java))
+                return true
+            }
+            2 -> {
+                combineAndReadAloud()
+                return true
+            }
         }
         return super.onOptionsItemSelected(item)
+    }
+
+    private fun exitSelectionMode() {
+        selectionMode = false
+        selected.clear()
+        refreshMenuAndList()
+    }
+
+    private fun refreshMenuAndList() {
+        window.decorView.post { invalidateOptionsMenu() } // see DetailActivity's identical note on why this is deferred
+        (listView.adapter as? BaseAdapter)?.notifyDataSetChanged()
+    }
+
+    /** Concatenates the selected digests' markdown into one ad-hoc digest
+     * and opens it with reading already started - nothing is persisted,
+     * this is purely a "read several back to back" convenience. */
+    private fun combineAndReadAloud() {
+        val chosen = selected.sorted().map { entries[it] }
+        if (chosen.isEmpty()) return
+
+        val combinedTopic = if (chosen.size <= 3) {
+            chosen.joinToString(" + ") { it.topic }
+        } else {
+            "Combined digest (${chosen.size} topics)"
+        }
+        val combinedMarkdown = if (chosen.size == 1) {
+            chosen[0].markdown
+        } else {
+            chosen.joinToString("\n\n") { "**${it.topic}**\n\n${it.markdown}" }
+        }
+        val combinedRefs = JSONArray()
+        for (e in chosen) for (i in 0 until e.references.length()) combinedRefs.put(e.references.get(i))
+
+        val intent = Intent(this, DetailActivity::class.java).apply {
+            putExtra("type", "digest")
+            putExtra("date", chosen[0].date)
+            putExtra("topic", combinedTopic)
+            putExtra("markdown", combinedMarkdown)
+            putExtra("references", combinedRefs.toString())
+            putExtra("autoReadAloud", true)
+        }
+        exitSelectionMode()
+        startActivity(intent)
     }
 
     private fun load() {
@@ -171,9 +242,10 @@ class MainActivity : Activity() {
         startActivity(intent)
     }
 
-    private inner class EntryAdapter : BaseAdapter(), AdapterView.OnItemClickListener {
+    private inner class EntryAdapter : BaseAdapter(), AdapterView.OnItemClickListener, AdapterView.OnItemLongClickListener {
         init {
             listView.onItemClickListener = this
+            listView.onItemLongClickListener = this
         }
 
         override fun getCount() = entries.size
@@ -182,26 +254,32 @@ class MainActivity : Activity() {
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
             val entry = entries[position]
+            val isSelected = position in selected
             val container = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 val padH = Theme.dp(this@MainActivity, 20)
                 val padV = Theme.dp(this@MainActivity, 16)
                 setPadding(padH, padV, padH, padV)
-                background = Theme.rippleOn(Theme.roundedDrawable(Theme.bg, this@MainActivity, radiusDp = 0))
+                // ~20% opacity primary tint over the row when selected -
+                // composites against the list's own opaque background
+                // behind it, so it reads as a tinted card, not garish.
+                val bg = if (isSelected) (0x33000000 or (Theme.primary and 0x00FFFFFF)) else Theme.bg
+                background = Theme.rippleOn(Theme.roundedDrawable(bg, this@MainActivity, radiusDp = 0))
             }
 
+            val sourceCount = entry.references.length()
             val badge = TextView(this@MainActivity).apply {
-                text = "DIGEST"
+                text = if (sourceCount == 1) "1 SOURCE" else "$sourceCount SOURCES"
                 textSize = 10f
                 setTextColor(Theme.onPrimary)
                 background = Theme.roundedDrawable(Theme.primary, this@MainActivity, radiusDp = 4)
                 setPadding(Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2), Theme.dp(this@MainActivity, 8), Theme.dp(this@MainActivity, 2))
             }
             val title = TextView(this@MainActivity).apply {
-                text = entry.topic
+                text = (if (isSelected) "✓ " else "") + entry.topic
                 textSize = 16f
                 setTypeface(null, Typeface.BOLD)
-                setTextColor(Theme.onBackground)
+                setTextColor(if (isSelected) Theme.primary else Theme.onBackground)
                 setPadding(0, Theme.dp(this@MainActivity, 6), 0, 0)
             }
             val subtitle = TextView(this@MainActivity).apply {
@@ -224,8 +302,25 @@ class MainActivity : Activity() {
             return container
         }
 
+        private fun toggleSelection(position: Int) {
+            if (!selected.add(position)) selected.remove(position)
+            if (selected.isEmpty()) selectionMode = false
+            refreshMenuAndList()
+        }
+
         override fun onItemClick(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-            openDetail(entries[position])
+            if (selectionMode) toggleSelection(position) else openDetail(entries[position])
+        }
+
+        override fun onItemLongClick(parent: AdapterView<*>?, view: View?, position: Int, id: Long): Boolean {
+            if (!selectionMode) {
+                selectionMode = true
+                selected.add(position)
+                refreshMenuAndList()
+            } else {
+                toggleSelection(position)
+            }
+            return true
         }
     }
 }
