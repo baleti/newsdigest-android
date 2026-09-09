@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -141,6 +143,22 @@ class TtsPlaybackService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentTitle: String = "News Digest"
     @Volatile private var lastSentenceText: String = "Preparing..."
+
+    // Shown as the media notification's large icon and the lock-screen/
+    // Bluetooth/Android-Auto media-session artwork - same app icon
+    // either way, decoded once and reused rather than re-decoding per
+    // notification update. There's no generated R class in this no-Gradle
+    // build (see build.sh - aapt2 link never emits one), so the resource
+    // is looked up by name at runtime instead of via R.mipmap.ic_launcher.
+    private val artBitmap: Bitmap? by lazy {
+        try {
+            val resId = resources.getIdentifier("ic_launcher", "mipmap", packageName)
+            if (resId == 0) null else BitmapFactory.decodeResource(resources, resId)
+        } catch (e: Exception) {
+            Log.e(TAG, "failed to load app icon for media art: ${e.message}")
+            null
+        }
+    }
 
     /** All the places that change `playing` route through here instead of
      * assigning it directly, so HighlightListener.onPlayingChanged fires
@@ -279,6 +297,7 @@ class TtsPlaybackService : Service() {
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, title)
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, 0L)
+                .apply { artBitmap?.let { putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) } }
                 .build(),
         )
         try {
@@ -300,6 +319,7 @@ class TtsPlaybackService : Service() {
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, totalMs)
+                .apply { artBitmap?.let { putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) } }
                 .build(),
         )
     }
@@ -635,6 +655,7 @@ class TtsPlaybackService : Service() {
             .setContentTitle(currentTitle)
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .apply { artBitmap?.let { setLargeIcon(it) } }
             .setOngoing(true)
             .addAction(playPauseAction)
             .addAction(stopAction)
