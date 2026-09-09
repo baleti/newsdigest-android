@@ -109,6 +109,22 @@ piece a genuinely descriptive title (like a newsletter issue headline
 capturing what actually stood out today), not a generic label like
 "Daily Digest" or "Overview".
 
+Order matters more than grouping-by-source: lead with whatever is most
+actionable or most relevant to you right now, based on your own
+projects and activity (whatever your personalization above tells the
+model about that), not with whatever happens to be loudest in the feeds
+or came from a particular source. "Actionable" means something you
+could plausibly need to actually do something about soon - a decision
+pending, a deadline, someone waiting on a reply, a bug or regression
+that touches something you run, an opportunity with a closing date, a
+direct follow-up to something you've been working on. Rank the rest by
+how relevant it is to what you actually care about, not by recency or
+volume. Purely ambient/interesting-but-passive material (general
+industry news with no bearing on anything of yours) goes last. This is
+about ordering within the one continuous piece, not sectioning it -
+still flow from one subject into the next with real transitions, just
+start with what matters most and taper off from there.
+
 Every story or item you mention by name must carry a markdown link
 [label](url) to its original link field, when it has one - never mention
 a linkable item without linking it, and never invent a URL that isn't in
