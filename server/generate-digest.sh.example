@@ -19,7 +19,59 @@ print('\n'.join(paths))
 ")
 
 TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
+PREV_HOURS_FILE=$(mktemp)
+PREV_TEXT_FILE=$(mktemp)
+trap 'rm -f "$TMP" "$PREV_HOURS_FILE" "$PREV_TEXT_FILE"' EXIT
+
+# Find whatever digest run most recently preceded this one (if any) so the
+# prompt below can tell the model what it already covered - if you run
+# this more than once a day, each run otherwise looks at a largely
+# overlapping window of source material, and without this a story still
+# circulating in the feeds (but not actually developing) gets rewritten
+# nearly verbatim run after run.
+python3 -c "
+import glob, json, os, re, time
+
+files = [f for f in glob.glob(os.path.expanduser('~/.cache/newsdigest-server/digest/*.json'))
+         if re.match(r'\d{4}-\d{2}-\d{2}-\d{2}\.json\$', os.path.basename(f))]
+files.sort()  # YYYY-MM-DD-HH names sort chronologically
+
+hours_ago = 24
+if files:
+    prev = files[-1]
+    hours_ago = max(1, round((time.time() - os.path.getmtime(prev)) / 3600))
+    try:
+        d = json.load(open(prev))
+        topic = d['digests'][0].get('topic', '')
+        md = d['digests'][0].get('markdown', '')
+        if md:
+            with open('$PREV_TEXT_FILE', 'w') as f:
+                f.write(f'{topic}\n\n{md}')
+    except Exception:
+        pass
+
+with open('$PREV_HOURS_FILE', 'w') as f:
+    f.write(str(hours_ago))
+"
+PREV_HOURS_AGO=$(cat "$PREV_HOURS_FILE")
+
+if [ -s "$PREV_TEXT_FILE" ]; then
+    NO_REPEAT_SECTION="For reference, here is the digest you wrote last time (about $PREV_HOURS_AGO hours ago):
+
+---
+$(cat "$PREV_TEXT_FILE")
+---
+
+Do not repeat any story or item from it unless something has genuinely
+changed since then - real new developments, a follow-up, updated
+numbers, a resolution to something left open. A story that is still
+circulating in the feeds with nothing actually new to say about it
+should be left out entirely, even if it would otherwise be the loudest
+thing today. This digest should read as what's NEW since last time, not
+a recap of what you already said."
+else
+    NO_REPEAT_SECTION=""
+fi
 
 claude --dangerously-skip-permissions -p "$(cat <<PROMPT
 Read today's new activity from these JSONL files (one JSON object per
@@ -27,7 +79,9 @@ line; fields include title, summary, feed_title, tags, link, published):
 
 $SOURCE_FILES
 
-Filter to items published or fetched in roughly the last 24 hours.
+Filter to items published or fetched in roughly the last $PREV_HOURS_AGO hours.
+
+$NO_REPEAT_SECTION
 
 # --- fill in your own personalization here ---
 # e.g. "skim ~/notes/about-me.md for context on who I am and what I
@@ -35,12 +89,20 @@ Filter to items published or fetched in roughly the last 24 hours.
 # are actually worth your time, and how they connect to what you're
 # working on.
 
-Write ONE single long-form daily digest covering everything from today
-across every source above - not split into separate topic pieces, one
-continuous read. Aim for roughly 3,000-5,000 words: go into real depth
-on each thing that happened - actual narrative substance, how items
-connect to each other and to what you're working on - rather than a set
-of short highlights. Let one subject flow into the next with real
+Write ONE single long-form digest covering everything genuinely new
+since the last one, across every source above - not split into separate
+topic pieces, one continuous read. Length should follow entirely from
+how much real material there is, never from a target: a full ~24-hour
+window usually supports something like 3,000-5,000 words of real depth,
+but a shorter top-up run not long after the previous one - especially
+once the no-repeat rule above has done its job - might genuinely only
+have a few hundred words to say, and that is correct, not a shortfall.
+Never pad to hit a length by restating what the previous digest already
+covered or by dwelling on something with nothing new to add. Go into
+real depth on each thing that IS genuinely new - actual narrative
+substance, how items connect to each other and to what you're working
+on - rather than a set of short highlights. Let one subject flow into
+the next with real
 transitions, the way someone telling you about their whole day would,
 not a bulleted report or a series of restarted sections. Give the whole
 piece a genuinely descriptive title (like a newsletter issue headline
