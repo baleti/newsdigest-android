@@ -429,7 +429,7 @@ class DetailActivity : Activity() {
                         // it doesn't belong in this thread at all - matches
                         // claudeagents-android's own ChatActivity treatment.
                         m.role == "tool_result" -> {}
-                        m.role == "user" -> addChatBubble("You", m.text)
+                        m.role == "user" -> addChatBubble("You", displayUserText(m.text))
                         // "→ Bash: ..." / "→ Read(...)" - a tool call
                         // summary, not prose - a one-line muted status
                         // row rather than a full bubble with its own
@@ -445,6 +445,27 @@ class DetailActivity : Activity() {
         )
         agentChat = client
         return client
+    }
+
+    /** The very first message of a conversation carries the full article/
+     * digest text ahead of the actual question - Claude needs that for
+     * context, but the article is already right there on screen, so
+     * showing it a second time in the chat thread (every time the
+     * conversation is resumed, not just when it was sent) is pure noise.
+     * Show only the "Question: ..." tail this activity itself appended in
+     * onSend() below; a follow-up message has no such marker and passes
+     * through unchanged.
+     *
+     * Matches on "Question: " alone, not "\n\nQuestion: " - confirmed live
+     * that the newlines onSend() puts before it don't survive the trip
+     * through tmux's paste handling into the transcript (a long/multi-line
+     * send arrives back with every newline stripped, sentences run
+     * straight together with no separator at all), so a leading-newline
+     * marker never matched and the recap kept showing on resume. */
+    private fun displayUserText(text: String): String {
+        val marker = "Question: "
+        val idx = text.lastIndexOf(marker)
+        return if (idx >= 0) text.substring(idx + marker.length) else text
     }
 
     private fun onSend() {

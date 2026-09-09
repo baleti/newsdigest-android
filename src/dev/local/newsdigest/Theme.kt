@@ -29,30 +29,6 @@ object Theme {
     const val muted = 0xFF8A8270.toInt()
     const val linkColor = 0xFF7FC4FF.toInt()
 
-    // Digest categories are whatever the generator decides that day (see
-    // build_digest_json.py) - unbounded and unpredictable, so there's no
-    // fixed color per category name. Instead: a spread of hues distinct
-    // enough from each other AND from the amber primary (used for the
-    // separate source-count badge), picked by a stable hash of the
-    // category string - same category always lands on the same color
-    // within a run, different categories usually land on different ones.
-    private val categoryPalette = listOf(
-        0xFFB0413E.toInt(), // red
-        0xFFB0713A.toInt(), // orange
-        0xFF4C8C4A.toInt(), // green
-        0xFF2E8B87.toInt(), // teal
-        0xFF3A6EA5.toInt(), // blue
-        0xFF5A5AB0.toInt(), // indigo
-        0xFF8A4CA8.toInt(), // purple
-        0xFFB0407A.toInt(), // rose
-    )
-
-    fun colorForCategory(category: String): Int {
-        if (category.isBlank()) return surfaceContainer
-        val idx = (category.trim().lowercase().hashCode().and(Int.MAX_VALUE)) % categoryPalette.size
-        return categoryPalette[idx]
-    }
-
     const val roundingDp = 10
     const val spacingDp = 8
 
