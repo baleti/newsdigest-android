@@ -8,7 +8,6 @@ import android.content.ServiceConnection
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.IBinder
-import android.text.method.LinkMovementMethod
 import android.util.Log
 import android.view.Gravity
 import android.view.Menu
@@ -98,9 +97,10 @@ class DetailActivity : Activity() {
                     // The plain caption has no real hyperlinks of its own
                     // (see ReadAloudController's docstring) - the only
                     // ClickableSpans in it are the per-word seek targets
-                    // it adds itself, so LinkMovementMethod here is safe
-                    // and is what lets tapping a word actually seek.
-                    contentView.movementMethod = LinkMovementMethod.getInstance()
+                    // it adds itself, and there's one per word, so this is
+                    // exactly the many-spans-in-a-ScrollView case
+                    // LinkTapHandler exists for.
+                    LinkTapHandler.attach(contentView)
                 } else {
                     playerBar.hide()
                     // Restore the rich static view whenever playback
@@ -109,7 +109,7 @@ class DetailActivity : Activity() {
                     // for both, so this one place covers it).
                     if (isDigest) {
                         contentView.text = MarkdownRenderer.render(rawContent) { url -> openArticle(url) }
-                        contentView.movementMethod = LinkMovementMethod.getInstance()
+                        LinkTapHandler.attach(contentView)
                     } else {
                         contentView.text = rawContent
                     }
@@ -212,7 +212,7 @@ class DetailActivity : Activity() {
             textSize = 15f
             setTextColor(Theme.onBackground)
             setLineSpacing(dp(4).toFloat(), 1f)
-            movementMethod = LinkMovementMethod.getInstance()
+            LinkTapHandler.attach(this)
             setLinkTextColor(Theme.linkColor)
         }
         contentContainer.addView(titleView)
@@ -314,7 +314,7 @@ class DetailActivity : Activity() {
             // restore the rich static view once playback stops
             if (isDigest) {
                 contentView.text = MarkdownRenderer.render(rawContent) { url -> openArticle(url) }
-                contentView.movementMethod = LinkMovementMethod.getInstance()
+                LinkTapHandler.attach(contentView)
             } else {
                 contentView.text = rawContent
             }

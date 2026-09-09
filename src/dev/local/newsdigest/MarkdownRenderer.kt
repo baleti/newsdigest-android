@@ -30,12 +30,37 @@ object MarkdownRenderer {
     private val CODE_SPAN_RE = Regex("""`([^`]+)`""")
     private val HEADER_RE = Regex("(?m)^#{1,6}\\s*")
     private val BULLET_RE = Regex("(?m)^\\s*[-*]\\s+")
-    // One capture group for the wrapper (*** / ** / * / ___ / __ / _), same
-    // as text_clean.py's _BOLD_ITALIC_RE - it doesn't distinguish bold from
+    // Underscore variants (___, __, _) deliberately excluded from this
+    // alternation - confirmed live 2026-09-09: a digest mentioning its own
+    // code (snake_case identifiers/regex names like text_clean.py or
+    // _BOLD_ITALIC_RE) got silently mangled, because a lone "_" reads as
+    // valid ad-hoc italic open/close on either side of any inner "_word_"
+    // run inside such an identifier - this regex doesn't (and, this
+    // simply, can't) apply CommonMark's real rule that underscore emphasis
+    // must sit at a word boundary, not just anywhere. Asterisks aren't
+    // ambiguous the same way (words don't naturally contain "*"), and the
+    // generator prompt only ever asks for "**bold**" anyway, so dropping
+    // underscore support entirely removes the false-positive risk with no
+    // loss of real functionality. Must stay in sync with text_clean.py's
+    // _BOLD_ITALIC_RE (same fix there, same reasoning).
+    //
+    // One capture group for the wrapper (*** / ** / *) - same as
+    // text_clean.py's _BOLD_ITALIC_RE, it doesn't distinguish bold from
     // italic either, just strips whichever wrapper matched. Bold styling
     // below is applied uniformly rather than trying to tell them apart,
-    // matching that same "good enough, not exact" bar.
-    private val EMPHASIS_RE = Regex("""(\*\*\*|\*\*|\*|___|__|_)(.+?)\1""")
+    // matching that same "good enough, not exact" bar. DOT_MATCHES_ALL so
+    // a bold/italic run that happens to span a line break (an embedded
+    // "\n" in the markdown source, not word-wrap) is still found -- without
+    // it, "." can't cross a newline at all, so the closing wrapper on a
+    // later line was never matched and the "**" markers rendered literally
+    // (reported live 2026-09-09, in claude-agents-android's parallel
+    // renderer -- same underlying gap here, fixed in both). text_clean.py's
+    // own _BOLD_ITALIC_RE needs the matching re.DOTALL fix alongside this
+    // one, or a sentence containing a wrapped bold run would clean
+    // differently server-side than it renders here, breaking the
+    // exact-string match ReadAloudController's highlighting relies on
+    // (see this file's class doc).
+    private val EMPHASIS_RE = Regex("""(\*\*\*|\*\*|\*)(.+?)\1""", RegexOption.DOT_MATCHES_ALL)
 
     fun render(markdown: String, onLinkClick: (String) -> Unit): SpannableStringBuilder {
         // Plain string transforms first - none of these need span tracking,

@@ -3,7 +3,6 @@ package dev.local.newsdigest
 import android.app.Activity
 import android.os.Bundle
 import android.text.Html
-import android.text.method.LinkMovementMethod
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
@@ -150,7 +149,12 @@ class ArticleActivity : Activity() {
                         // Needed for ReadAloudController's per-word seek
                         // spans to actually receive taps - this plain
                         // extracted text has no other links to worry about.
-                        movementMethod = LinkMovementMethod.getInstance()
+                        // LinkTapHandler rather than LinkMovementMethod:
+                        // one ClickableSpan per word adds up fast on a
+                        // full article, and LinkMovementMethod hit-tests
+                        // all of them on every touch move, not just a tap
+                        // (see that file's doc for the reasoning).
+                        LinkTapHandler.attach(this)
                     }
                     root.addView(contentView)
                 }
