@@ -188,27 +188,16 @@ class DetailActivity : Activity() {
                     }
                 }
             },
+            // A fresh SpannableStringBuilder every call, throttled to at
+            // most ~6-7/sec inside ReadAloudController itself (see its own
+            // doc) rather than reused-object + invalidate()-only - an
+            // earlier attempt at the latter (to fix choppy scrolling once
+            // the overview made the article longer) turned out to break
+            // word-tap-to-seek/link taps outright (reported live
+            // 2026-09-10), so it's back to plain reassignment here, just
+            // less often.
             onCaptionChanged = { caption ->
-                // caption is the SAME captionBuilder instance on every
-                // call within one reading session now (see
-                // ReadAloudController's doc) - reassigning contentView.text
-                // to it again on every ~60ms highlight tick forced a full
-                // TextView relayout of the whole (now overview+body-length)
-                // article that many times a second, which is what was
-                // actually behind two reported regressions: choppy
-                // scrolling while playing, and word-tap-to-seek
-                // (LinkTapHandler reading tv.layout at tap time) landing on
-                // stale/mid-relayout geometry. Only a genuinely new object
-                // (the very first call of a session) needs the real
-                // assignment; every later call for the same object is just
-                // a cheap repaint of the moved highlight span.
-                if (readAloud.isActive()) {
-                    if (contentView.text !== caption) {
-                        contentView.text = caption
-                    } else {
-                        contentView.invalidate()
-                    }
-                }
+                if (readAloud.isActive()) contentView.text = caption
             },
             onGenerating = { generating, estimatedMs ->
                 if (generating) synthBanner.start(estimatedMs) else synthBanner.stop()

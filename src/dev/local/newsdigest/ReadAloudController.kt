@@ -85,6 +85,7 @@ class ReadAloudController(
     private var currentSentenceStartOffset = 0
     private var currentWordRanges: List<IntRange> = emptyList()
     private var highlightSpan: BackgroundColorSpan? = null
+    private var lastCaptionPushNanos = 0L
     // Char offset (into fullText/captionBuilder) of whichever word is
     // currently highlighted - null until the first onWordHighlight of a
     // session. Exposed via currentReadingOffset() so a caller can scroll
@@ -172,15 +173,28 @@ class ReadAloudController(
                 )
                 highlightSpan = span
                 currentHighlightStart = currentSentenceStartOffset + range.first
-                // The SAME captionBuilder instance every time (not a fresh
-                // copy) - see the class doc on why this matters as much as
-                // it does now that the overview is prepended to what's
-                // read: the caller only needs to call TextView.setText()
-                // once and can just invalidate() on every subsequent tick
-                // once it recognizes this is the same object, instead of
-                // forcing a full relayout of the whole (now longer) body
-                // on every ~60ms highlight tick for the entire session.
-                onCaptionChanged.invoke(captionBuilder)
+                // Throttled, not every single ~60ms tick - confirmed live
+                // 2026-09-10 that pushing a fresh SpannableStringBuilder
+                // copy (needed so the caller's TextView.setText() always
+                // sees a genuinely new object - see below) that often
+                // forced enough relayout traffic on the whole (now
+                // overview+body-length) article to make scrolling choppy.
+                // An earlier attempt fixed that by reusing the SAME
+                // captionBuilder object every time so the caller could
+                // skip setText() and just invalidate() - but that broke
+                // word-tap-to-seek/link taps outright (reported live
+                // 2026-09-10), so it's reverted here: a fresh copy is what
+                // LinkTapHandler's tap-time `tv.text as? Spannable` read
+                // was actually built and proven against, and this project
+                // has no test harness to safely re-verify a change to that
+                // contract blind. Throttling the PUSH RATE instead cuts
+                // relayout frequency by roughly 3x while keeping the
+                // known-working "always a fresh object" behavior intact.
+                val now = System.nanoTime()
+                if (now - lastCaptionPushNanos >= 150_000_000L) {
+                    lastCaptionPushNanos = now
+                    onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
+                }
             }
         }
 
@@ -329,10 +343,10 @@ class ReadAloudController(
         searchCursor = clampedStart
         highlightSpan = null
         currentHighlightStart = null
+        lastCaptionPushNanos = 0L
         active = true
         onStateChanged.invoke(true)
-        // Same object every time from here on (see onWordHighlight's doc)
-        onCaptionChanged.invoke(captionBuilder)
+        onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
         if (synthSampleCount == 0) {
             // No real data yet at all (first read this activity has done) -
             // seed with an engine-aware guess rather than the generic
@@ -424,7 +438,18 @@ class ReadAloudController(
         val resumeText = fullText.substring(clamped).trimStart()
         if (resumeText.isBlank()) return
         ws?.close() // stop the old stream's remaining sentences from arriving after the new ones
-        svc.jumpToUpcoming()
+        // Proportional character-offset estimate of the target's real
+        // time position - see jumpToUpcoming's own doc for why this has
+        // to be passed in explicitly rather than left to that function's
+        // own default (which assumes the jump is always forward, past
+        // whatever's already buffered - wrong for a scrubber/skip-ahead
+        // seeking BACKWARD to a point already behind the buffer).
+        val estimatedMs = if (fullText.isNotEmpty()) {
+            (clamped.toFloat() / fullText.length * (svc.getDisplayDurationMs())).toLong()
+        } else {
+            0L
+        }
+        svc.jumpToUpcoming(estimatedMs)
         searchCursor = fullText.length - resumeText.length
         onGenerating(true, avgSynthMs)
         streamText(resumeText, svc)

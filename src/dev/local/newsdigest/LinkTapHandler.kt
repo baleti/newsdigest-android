@@ -2,6 +2,7 @@ package dev.local.newsdigest
 
 import android.text.Spannable
 import android.text.style.ClickableSpan
+import android.util.Log
 import android.view.MotionEvent
 import android.widget.TextView
 import kotlin.math.abs
@@ -39,6 +40,11 @@ object LinkTapHandler {
                 MotionEvent.ACTION_UP -> {
                     val movedPx = maxOf(abs(event.x - downX), abs(event.y - downY))
                     val elapsedMs = event.eventTime - downTime
+                    // Temporary diagnostic logging (2026-09-10) - word-tap-
+                    // seek has been reported not working twice now with no
+                    // obvious cause found by reading the code, so this
+                    // pins down exactly which branch a real tap actually
+                    // takes instead of guessing further blind.
                     if (movedPx < TAP_SLOP_PX && elapsedMs < TAP_MAX_MS) {
                         val tv = view as TextView
                         val layout = tv.layout
@@ -48,9 +54,18 @@ object LinkTapHandler {
                             val y = event.y.toInt() - tv.totalPaddingTop + tv.scrollY
                             val line = layout.getLineForVertical(y)
                             val offset = layout.getOffsetForHorizontal(line, x)
-                            spannable.getSpans(offset, offset, ClickableSpan::class.java)
-                                .firstOrNull()?.onClick(tv)
+                            val spans = spannable.getSpans(offset, offset, ClickableSpan::class.java)
+                            val nearby = spannable.subSequence(
+                                (offset - 15).coerceAtLeast(0),
+                                (offset + 15).coerceAtMost(spannable.length),
+                            )
+                            Log.d("LinkTapHandler", "tap registered: offset=$offset spansFound=${spans.size} nearbyText=$nearby")
+                            spans.firstOrNull()?.onClick(tv)
+                        } else {
+                            Log.d("LinkTapHandler", "tap ignored: layout=$layout spannable=$spannable (text type=${tv.text?.javaClass})")
                         }
+                    } else {
+                        Log.d("LinkTapHandler", "tap rejected as drag: movedPx=$movedPx elapsedMs=$elapsedMs")
                     }
                 }
             }

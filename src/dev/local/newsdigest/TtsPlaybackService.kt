@@ -100,6 +100,7 @@ class TtsPlaybackService : Service() {
     private val allSentences = mutableListOf<QueuedSentence>()
     private var playIndex = 0 // guarded by lock: index playLoop is on/about to (re)start
     private var seekOffsetMs = 0L // guarded by lock: ms into allSentences[playIndex] to start from
+    private var positionBaseMs = 0L // guarded by lock: see positionMsUpTo's own doc
     @Volatile private var seekGeneration = 0 // bumped on every seek/stop; an in-flight write loop checks this to abandon itself early
 
     // Bumped on every startSession(). Confirmed live: calling stopAll() on
@@ -283,6 +284,7 @@ class TtsPlaybackService : Service() {
             allSentences.clear()
             playIndex = 0
             seekOffsetMs = 0L
+            positionBaseMs = 0L
         }
         setPositionAnchor(0L, false)
         mediaSession?.setMetadata(
@@ -449,19 +451,40 @@ class TtsPlaybackService : Service() {
         updatePlaybackState(PlaybackState.STATE_PLAYING)
     }
 
-    /** For "skip ahead past what's been synthesized so far": positions
-     * the session so the NEXT enqueueSentence() call becomes the very
-     * next thing played, abandoning whatever was still mid-flight for
-     * the gap being skipped - that gap is simply never synthesized, not
-     * queued up behind the jump. Unlike seekTo(), this doesn't require
-     * the target to already exist in allSentences - the caller is about
-     * to stream fresh sentences that will land at exactly this index. */
-    fun jumpToUpcoming() {
+    /** For "skip ahead/behind to a brand new point in the text": clears
+     * whatever was buffered and positions the session so the NEXT
+     * enqueueSentence() call becomes the very next thing played -
+     * abandoning whatever was still mid-flight for the gap being
+     * skipped, that gap is simply never synthesized, not queued up
+     * behind the jump. Unlike seekTo(), this doesn't require the target
+     * to already exist in allSentences - the caller is about to stream
+     * fresh sentences that will land at exactly this index.
+     *
+     * The buffer is cleared (not just re-pointed past) and estimatedMs
+     * becomes the new positionBaseMs - confirmed live 2026-09-10 as a
+     * real bug otherwise: this used to just set playIndex past whatever
+     * was already buffered and keep that old buffer around "to tap/seek
+     * back into" (see positionMsUpTo's own doc), which is fine for a
+     * FORWARD jump (the new content lands after old content that's
+     * still chronologically earlier) but breaks completely for a
+     * BACKWARD jump (a scrubber/skip-back can legitimately request this)
+     * - positionMsUpTo(playIndex) sums whatever's *before* the new
+     * sentences in the array regardless of what point in the TEXT they
+     * actually represent, so the very next real sentence to start
+     * playing silently overwrote the caller's correct estimatedMs
+     * anchor with "wherever the OLD forward-moving buffer had gotten
+     * to" - reported live as seeking backward instead landing near
+     * wherever playback already was, or past it. Clearing the buffer
+     * keeps positionMsUpTo's index-based summing consistent with
+     * whatever position it's actually being measured from. */
+    fun jumpToUpcoming(estimatedMs: Long? = null) {
         val resumeMs: Long
         synchronized(lock) {
-            playIndex = allSentences.size
+            allSentences.clear()
+            playIndex = 0
             seekOffsetMs = 0L
-            resumeMs = positionMsUpTo(allSentences.size)
+            positionBaseMs = estimatedMs ?: positionBaseMs
+            resumeMs = positionBaseMs
         }
         seekGeneration++
         sessionEnded = false // a fresh stream is about to start - not done yet
@@ -483,6 +506,7 @@ class TtsPlaybackService : Service() {
             allSentences.clear()
             playIndex = 0
             seekOffsetMs = 0L
+            positionBaseMs = 0L
         }
         setPositionAnchor(0L, false)
         audioTrack?.let {
@@ -632,12 +656,17 @@ class TtsPlaybackService : Service() {
         }
     }
 
-    /** Sum of durations of all sentences before `index` - i.e. the
-     * position at which sentence `index` begins, ignoring any intra-
-     * sentence offset. */
+    /** Sum of durations of all sentences before `index`, plus
+     * positionBaseMs - i.e. the position at which sentence `index`
+     * begins, ignoring any intra-sentence offset. positionBaseMs is
+     * normally 0 (allSentences genuinely starts at the top), but after a
+     * jumpToUpcoming(estimatedMs) it's whatever that jump's target
+     * position was - allSentences itself gets cleared by that same call,
+     * so index-to-duration summing alone has no way to know the fresh
+     * buffer doesn't start at time zero; this is that missing offset. */
     private fun positionMsUpTo(index: Int): Long {
         synchronized(lock) {
-            var total = 0L
+            var total = positionBaseMs
             for (i in 0 until index) total += allSentences.getOrNull(i)?.durationMs ?: 0L
             return total
         }
