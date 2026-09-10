@@ -104,12 +104,12 @@ class PlayerControlBar(
         // Sizes bumped up a second time -- reported live 2026-09-10, after
         // the codex-icon swap-in, still "too small" at the original
         // 14-22dp range this row used with the earlier hand-drawn icons.
-        val prevSectionButton = iconImageView(context, "ic_prev_section", 26) { onPreviousSection() }
-        val rewindButton = iconImageView(context, "ic_rewind", 32) { onRewind() }
+        val prevSectionButton = iconImageView(context, "ic_prev_section", 32) { onPreviousSection() }
+        val rewindButton = iconImageView(context, "ic_rewind", 38) { onRewind() }
         playPauseButton = PlayPauseImageView(context) { onPlayPause() }
-        val forwardButton = iconImageView(context, "ic_forward", 32) { onForward() }
-        val nextSectionButton = iconImageView(context, "ic_next_section", 26) { onNextSection() }
-        val locateButton = iconImageView(context, "ic_locate", 28) { onLocate() }
+        val forwardButton = iconImageView(context, "ic_forward", 38) { onForward() }
+        val nextSectionButton = iconImageView(context, "ic_next_section", 32) { onNextSection() }
+        val locateButton = iconImageView(context, "ic_locate", 22) { onLocate() }
         speedButton = iconButton("1x") { onSpeedClick(speedButton) }
 
         positionLabel = TextView(context).apply {
