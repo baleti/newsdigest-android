@@ -25,6 +25,7 @@ reading-highlight UI without adding a whole alignment model on the
 responsiveness-critical path.
 """
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
@@ -42,7 +43,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import FileResponse, JSONResponse
 
 import feed
-from acronyms import expand_acronyms
+from acronyms import expand_acronyms, expand_domains
 from text_clean import markdown_to_speech
 
 # The article/digest chat feature doesn't run claude itself - it proxies to
@@ -163,6 +164,76 @@ def float_to_pcm16(samples: np.ndarray) -> bytes:
     return (clipped * 32767.0).astype(np.int16).tobytes()
 
 
+# ------------------------------------------------------------- tts cache
+#
+# Keyed by exactly what determines the audio (engine, voice, the expanded
+# text actually handed to the model) - a digest sent again tomorrow, an
+# article reopened after being read once already, or two articles sharing
+# boilerplate all hit this for free. Disk-backed (not just in-process) so a
+# server restart (systemd unit redeploy, host reboot) doesn't throw away
+# everything already paid for - Chatterbox in particular runs 5-15s/sentence,
+# not something worth re-paying on every restart. Stored as raw PCM16 (the
+# exact bytes already sent over the wire) plus a small JSON sidecar, rather
+# than the float samples - skips reconstructing anything on a cache hit,
+# just replays the same bytes/metadata synthesize_and_send would have sent.
+
+TTS_CACHE_DIR = MODEL_DIR / "tts-cache"
+TTS_CACHE_MAX_BYTES = 2 * 1024 ** 3  # 2 GiB, evicted LRU by mtime
+
+
+def _tts_cache_key(engine_name: str, voice: str | None, expanded_text: str) -> str:
+    raw = f"{engine_name}\x00{voice or ''}\x00{expanded_text}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _tts_cache_paths(key: str) -> tuple[Path, Path]:
+    return TTS_CACHE_DIR / f"{key}.pcm", TTS_CACHE_DIR / f"{key}.json"
+
+
+def _tts_cache_load(key: str) -> tuple[bytes, dict] | None:
+    pcm_path, meta_path = _tts_cache_paths(key)
+    try:
+        meta = json.loads(meta_path.read_text())
+        pcm = pcm_path.read_bytes()
+    except (OSError, ValueError):
+        return None
+    now = time.time()
+    try:
+        os.utime(pcm_path, (now, now))
+        os.utime(meta_path, (now, now))
+    except OSError:
+        pass
+    return pcm, meta
+
+
+def _tts_cache_store(key: str, pcm: bytes, meta: dict) -> None:
+    try:
+        TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        pcm_path, meta_path = _tts_cache_paths(key)
+        pcm_path.write_bytes(pcm)
+        meta_path.write_text(json.dumps(meta))
+    except OSError:
+        return
+    _tts_cache_evict_if_needed()
+
+
+def _tts_cache_evict_if_needed() -> None:
+    try:
+        entries = sorted(TTS_CACHE_DIR.glob("*.pcm"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    total = sum(p.stat().st_size for p in entries)
+    for p in entries:
+        if total <= TTS_CACHE_MAX_BYTES:
+            break
+        try:
+            total -= p.stat().st_size
+            p.unlink(missing_ok=True)
+            p.with_suffix(".json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------- engines
 
 class KokoroEngine:
@@ -272,14 +343,36 @@ def feed_digests():
     """{"date": ..., "digests": [{"topic", "markdown", "references"}, ...]}
     - however many topic-clustered digests the last generation run found
     in that day's material (see generate-digest.sh.example); not a fixed
-    count or fixed set of topics."""
+    count or fixed set of topics. Kept for compatibility - the app itself
+    now calls /feed/digests/history to also see older runs."""
     digest = feed.latest_digest()
     if digest is None:
         return JSONResponse({"error": "no digest yet"}, status_code=404)
     return digest
 
 
+@app.get("/feed/digests/history")
+def feed_digests_history(limit: int = 30):
+    """[{"date", "run_id", "digests": [...]}, ...], newest run first - every
+    dated run still on disk (build_digest_json.py's own retention curve
+    decides how far back that goes), not just the latest one."""
+    return {"runs": feed.list_digest_runs(limit=min(limit, 100))}
+
+
 # ------------------------------------------------------------------- WS
+#
+# Lookahead cap: the synthesis loop below won't get more than this far
+# ahead of wherever the client says it actually is in playback. Without it,
+# the loop just races through synthesize_and_send() for the entire
+# article/message the moment the stream opens, regardless of whether
+# playback is paused or even still on the first sentence - reported live
+# 2026-09-09 ("doing the whole article after first play", specifically
+# after pressing pause). The client reports progress via periodic
+# {"type": "position", "played_ms": ...} messages (see ReadAloudController's
+# streamText()/streamCurrentSection()); a paused client simply stops
+# advancing that number, so the cap enforces itself with no separate
+# "paused" flag needed.
+TTS_LOOKAHEAD_CAP_MS = 30_000
 
 @app.websocket("/tts/stream")
 async def tts_stream(websocket: WebSocket):
@@ -317,10 +410,46 @@ async def tts_stream(websocket: WebSocket):
         # splitting sentences off the expanded text was fixed here.
         sentences = split_sentences(cleaned)
 
-        for sentence in sentences:
-            await synthesize_and_send(websocket, engine, sentence, voice)
+        # played_ms stays None until the client's first "position" message
+        # arrives, so a client that never sends one (an older build) gets
+        # no throttling at all rather than stalling forever after the first
+        # TTS_LOOKAHEAD_CAP_MS of audio. disconnected doubles as both "stop
+        # waiting, the socket is gone" and the wait's own sleep timer.
+        played_ms = {"value": None}
+        disconnected = asyncio.Event()
 
-        await websocket.send_json({"type": "done"})
+        async def receive_position_updates():
+            try:
+                while True:
+                    msg = await websocket.receive_json()
+                    if msg.get("type") == "position":
+                        v = msg.get("played_ms")
+                        if isinstance(v, (int, float)) and v >= 0:
+                            played_ms["value"] = v
+            except WebSocketDisconnect:
+                pass
+            finally:
+                disconnected.set()
+
+        position_task = asyncio.create_task(receive_position_updates())
+        try:
+            sent_ms = 0
+            for sentence in sentences:
+                while (
+                    played_ms["value"] is not None
+                    and sent_ms - played_ms["value"] > TTS_LOOKAHEAD_CAP_MS
+                ):
+                    if disconnected.is_set():
+                        return
+                    try:
+                        await asyncio.wait_for(disconnected.wait(), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        pass
+                sent_ms += await synthesize_and_send(websocket, engine, engine_name, sentence, voice)
+
+            await websocket.send_json({"type": "done"})
+        finally:
+            position_task.cancel()
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -335,24 +464,49 @@ async def tts_stream(websocket: WebSocket):
             pass
 
 
-async def synthesize_and_send(websocket: WebSocket, engine, sentence: str, voice: str | None):
+async def synthesize_and_send(
+    websocket: WebSocket, engine, engine_name: str, sentence: str, voice: str | None,
+) -> int:
     """sentence is exactly what the client will display and highlight -
-    acronym expansion happens only in the copy handed to the engine, never
-    reaching the client, so word timings always line up with what's shown
-    on screen (see the comment above tts_stream's sentence loop)."""
-    expanded = expand_acronyms(sentence)
+    acronym/domain expansion happens only in the copy handed to the engine,
+    never reaching the client, so word timings always line up with what's
+    shown on screen (see the comment above tts_stream's sentence loop).
+    Returns the sentence's duration in ms, so the caller can track how far
+    ahead of reported playback position it's gotten (see
+    TTS_LOOKAHEAD_CAP_MS)."""
+    expanded = expand_domains(expand_acronyms(sentence))
+    cache_key = _tts_cache_key(engine_name, voice, expanded)
+    cached = await run_in_threadpool(_tts_cache_load, cache_key)
+    if cached is not None:
+        pcm, meta = cached
+        duration_ms = meta["duration_ms"]
+        await websocket.send_json({
+            "type": "sentence",
+            "text": sentence,
+            "sample_rate": meta["sample_rate"],
+            "duration_ms": duration_ms,
+            "synth_ms": 0,
+            "words": estimate_word_timings(sentence, duration_ms / 1000),
+        })
+        await websocket.send_bytes(pcm)
+        return duration_ms
+
     t0 = time.monotonic()
     samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
     duration_s = len(samples) / sr
+    duration_ms = round(duration_s * 1000)
+    pcm = float_to_pcm16(samples)
+    await run_in_threadpool(_tts_cache_store, cache_key, pcm, {"sample_rate": sr, "duration_ms": duration_ms})
     await websocket.send_json({
         "type": "sentence",
         "text": sentence,
         "sample_rate": sr,
-        "duration_ms": round(duration_s * 1000),
+        "duration_ms": duration_ms,
         "synth_ms": round((time.monotonic() - t0) * 1000),
         "words": estimate_word_timings(sentence, duration_s),
     })
-    await websocket.send_bytes(float_to_pcm16(samples))
+    await websocket.send_bytes(pcm)
+    return duration_ms
 
 
 # ------------------------------------------------------------------ agent

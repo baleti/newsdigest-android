@@ -12,7 +12,6 @@ import android.text.SpannableStringBuilder
 import android.text.TextPaint
 import android.text.style.BackgroundColorSpan
 import android.text.style.ClickableSpan
-import android.text.style.ForegroundColorSpan
 import android.util.Log
 import android.view.View
 import org.json.JSONObject
@@ -74,10 +73,25 @@ class ReadAloudController(
     // so the on-screen content never disappears once playback starts.
     private val captionBuilder = SpannableStringBuilder()
     private var fullText = ""
+    // Character offsets into fullText where each "section" (paragraph)
+    // begins -- asked for explicitly: "split text into sections ... in
+    // news [digest] it would likely be paragraphs or when topic changes".
+    // Computed once in start(); skipToNextSection() below just reuses the
+    // exact same abandon-and-restart mechanism word-tap-seek (skipAheadTo)
+    // already provides, jumping to the next entry in this list instead of
+    // an arbitrary tapped character.
+    private var sectionStarts: List<Int> = listOf(0)
     private var searchCursor = 0
     private var currentSentenceStartOffset = 0
     private var currentWordRanges: List<IntRange> = emptyList()
     private var highlightSpan: BackgroundColorSpan? = null
+    // Char offset (into fullText/captionBuilder) of whichever word is
+    // currently highlighted - null until the first onWordHighlight of a
+    // session. Exposed via currentReadingOffset() so a caller can scroll
+    // back to the live position on demand (asked for explicitly
+    // 2026-09-10: "hard to find where it's at when scrolling larger
+    // articles").
+    private var currentHighlightStart: Int? = null
     @Volatile private var active = false
     @Volatile private var currentSpeed = 1.0f
     // Bumped every streamText() call. skipAheadTo() closes the old socket
@@ -157,7 +171,16 @@ class ReadAloudController(
                     Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
                 )
                 highlightSpan = span
-                onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
+                currentHighlightStart = currentSentenceStartOffset + range.first
+                // The SAME captionBuilder instance every time (not a fresh
+                // copy) - see the class doc on why this matters as much as
+                // it does now that the overview is prepended to what's
+                // read: the caller only needs to call TextView.setText()
+                // once and can just invalidate() on every subsequent tick
+                // once it recognizes this is the same object, instead of
+                // forcing a full relayout of the whole (now longer) body
+                // on every ~60ms highlight tick for the entire session.
+                onCaptionChanged.invoke(captionBuilder)
             }
         }
 
@@ -237,6 +260,14 @@ class ReadAloudController(
 
     fun isActive(): Boolean = active
 
+    /** Char offset (into the same text onCaptionChanged hands the caller)
+     * of wherever reading currently is - the live-highlighted word once
+     * one has been highlighted this session, else the start of the
+     * current sentence. Null when not active. A caller uses this to
+     * scroll its own view back to the live position on demand. */
+    fun currentReadingOffset(): Int? =
+        if (!active) null else (currentHighlightStart ?: currentSentenceStartOffset)
+
     /** title is what shows in the media notification while this plays.
      * `text` can be plain, or a Spannable (e.g. MarkdownRenderer.render()'s
      * output) whose spans - link clicks, bold styling - carry over into
@@ -246,31 +277,42 @@ class ReadAloudController(
      * identical to what the server actually receives and times, since
      * markdown_to_speech() on the server strips the exact same
      * constructs this rendering already stripped - see class doc. */
-    fun start(title: String, text: CharSequence) {
+    // startOffset resumes a previous session instead of starting over --
+    // asked for explicitly 2026-09-10 ("save last position... Start again
+    // / Resume buttons"). The full text is still shown and word-spanned
+    // top to bottom either way (see below); only the actual TTS stream
+    // (streamText, at the very end of this function) begins partway
+    // through, at the saved character offset, rather than at 0.
+    fun start(title: String, text: CharSequence, startOffset: Int = 0) {
         stop()
         fullText = text.toString()
+        sectionStarts = splitIntoSections(fullText)
         knownWords.clear()
         captionBuilder.clear()
         captionBuilder.append(text) // shown in full immediately - reading only ever highlights within this, never replaces it
-        // Swap real link ClickableSpans (copied in by append() from a
-        // Spanned source) for plain blue coloring over the same range -
-        // during reading every tap should mean "seek here", never "open
-        // this link" (an overlapping real-link span would otherwise
-        // contend with the per-word one attachWordSpans() is about to
-        // add), but the blue is worth keeping as a "this was a link"
-        // reference. Bold styling (StyleSpan, not clickable) is unaffected.
-        for (span in captionBuilder.getSpans(0, captionBuilder.length, ClickableSpan::class.java)) {
-            val start = captionBuilder.getSpanStart(span)
-            val end = captionBuilder.getSpanEnd(span)
-            captionBuilder.removeSpan(span)
-            captionBuilder.setSpan(ForegroundColorSpan(Theme.linkColor), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        }
-        attachWordSpans(fullText)
-        searchCursor = 0
+        // Real link ClickableSpans (copied in by append() from a Spanned
+        // source) are kept live during reading, not swapped for plain
+        // color - tapping a reference link should open it whether or not
+        // playback is active (asked for explicitly 2026-09-09: "clicking
+        // on links should work both in normal and in read aloud modes").
+        // Their ranges are recorded so attachWordSpans() below can skip
+        // adding its own per-word seek span over the same characters -
+        // LinkTapHandler.attach() fires only the first ClickableSpan found
+        // at a tap's offset, so two overlapping spans there would make
+        // which action wins a coin flip; excluding link ranges from the
+        // word spans keeps it unambiguous (no tap-to-seek granularity
+        // inside a link's own words, seek still works everywhere else).
+        val linkRanges = captionBuilder.getSpans(0, captionBuilder.length, ClickableSpan::class.java)
+            .map { captionBuilder.getSpanStart(it) to captionBuilder.getSpanEnd(it) }
+        attachWordSpans(fullText, linkRanges)
+        val clampedStart = startOffset.coerceIn(0, fullText.length)
+        searchCursor = clampedStart
         highlightSpan = null
+        currentHighlightStart = null
         active = true
         onStateChanged.invoke(true)
-        onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
+        // Same object every time from here on (see onWordHighlight's doc)
+        onCaptionChanged.invoke(captionBuilder)
         if (synthSampleCount == 0) {
             // No real data yet at all (first read this activity has done) -
             // seed with an engine-aware guess rather than the generic
@@ -300,8 +342,19 @@ class ReadAloudController(
         // unbind(), even with the stop() call already removed from it.
         context.startForegroundService(Intent(context, TtsPlaybackService::class.java))
         svc.startSession(title)
+        val resumeText = fullText.substring(clampedStart)
+        // Rough upfront guess of the REMAINING length (not the whole
+        // article, when resuming) so the system media notification has an
+        // end-time to show immediately, rather than only whatever's been
+        // synthesized so far (which permanently lags behind real-time
+        // under the 30s lookahead cap) - see
+        // TtsPlaybackService.setEstimatedDuration's own doc. 160 words/
+        // minute is a typical spoken-word rate; real per-sentence
+        // durations (enqueueSentence) take over once they exceed this.
+        val wordCount = resumeText.split(Regex("\\s+")).count { it.isNotBlank() }
+        svc.setEstimatedDuration((wordCount / (160.0 / 60.0) * 1000).toLong())
         svc.setPlaybackSpeed(currentSpeed)
-        streamText(fullText, svc)
+        streamText(resumeText, svc)
     }
 
     /** One ClickableSpan per whitespace-delimited word across the WHOLE
@@ -310,10 +363,11 @@ class ReadAloudController(
      * attach time), so the very same span transparently seeks once its
      * word has been read, or skips ahead if it hasn't yet - no need to
      * ever swap a span out as synthesis catches up to it. */
-    private fun attachWordSpans(text: String) {
+    private fun attachWordSpans(text: String, linkRanges: List<Pair<Int, Int>>) {
         for (m in Regex("\\S+").findAll(text)) {
             val wordStart = m.range.first
             val wordEnd = m.range.last + 1
+            if (linkRanges.any { (s, e) -> wordStart < e && wordEnd > s }) continue
             captionBuilder.setSpan(
                 object : ClickableSpan() {
                     override fun onClick(widget: View) = handleWordTap(wordStart)
@@ -356,6 +410,50 @@ class ReadAloudController(
         streamText(resumeText, svc)
     }
 
+    /** Paragraph boundaries (a blank line) as character offsets into
+     * `text` -- always includes 0. In practice a topic change in
+     * generated article/digest text already lands on a paragraph break,
+     * so this doubles as "when topic changes" without needing separate
+     * topic-detection logic. */
+    private fun splitIntoSections(text: String): List<Int> {
+        val starts = mutableListOf(0)
+        for (m in Regex("\\n\\s*\\n").findAll(text)) {
+            val next = m.range.last + 1
+            if (next < text.length) starts.add(next)
+        }
+        return starts
+    }
+
+    /** Index into sectionStarts for wherever the currently-playing (or
+     * most recently started) sentence began -- the highest boundary at or
+     * before it. */
+    private fun currentSectionIndex(): Int {
+        var idx = 0
+        for (i in sectionStarts.indices) {
+            if (sectionStarts[i] <= currentSentenceStartOffset) idx = i else break
+        }
+        return idx
+    }
+
+    fun hasNextSection(): Boolean = currentSectionIndex() + 1 < sectionStarts.size
+
+    /** Skips to the start of the next paragraph -- exactly skipAheadTo()'s
+     * own abandon-and-restart mechanism (already proven for word-tap-seek),
+     * just aimed at the next section boundary instead of a tapped word. */
+    fun skipToNextSection() {
+        val idx = currentSectionIndex()
+        if (idx + 1 >= sectionStarts.size) return
+        skipAheadTo(sectionStarts[idx + 1])
+    }
+
+    /** Same as skipToNextSection() but backwards -- jumps to the start of
+     * the previous paragraph. No-op on the first section. */
+    fun skipToPreviousSection() {
+        val idx = currentSectionIndex()
+        if (idx <= 0) return
+        skipAheadTo(sectionStarts[idx - 1])
+    }
+
     /** Connects to /tts/stream, sends `text`, and enqueues every sentence
      * that comes back onto `svc` as it arrives. Used both for the initial
      * read and for resuming after skipAheadTo() - the only difference is
@@ -363,6 +461,30 @@ class ReadAloudController(
     private fun streamText(text: String, svc: TtsPlaybackService) {
         val myGeneration = ++streamGeneration
         fun isCurrent() = streamGeneration == myGeneration
+        // Base position this stream builds on top of - 0 for the initial
+        // start(), or wherever a skipAheadTo() jump landed - so the
+        // "played_ms" reported below is relative to THIS stream's own
+        // audio, matching how the server counts what it's sent.
+        val streamStartPositionMs = svc.getPositionMs()
+
+        // Tells the server how far playback has actually gotten into this
+        // stream, every 500ms, so it can cap how far ahead of that it
+        // synthesizes (see server.py's TTS_LOOKAHEAD_CAP_MS). A paused
+        // player simply stops advancing getPositionMs(), which is exactly
+        // what makes the server stall on its own - no separate pause
+        // signal needed. Reported live 2026-09-09: the server was
+        // synthesizing the entire article right after the first play.
+        fun reportPosition(client: WebSocketClient) {
+            if (!isCurrent()) return
+            val playedMs = (svc.getPositionMs() - streamStartPositionMs).coerceAtLeast(0)
+            try {
+                client.sendText(JSONObject().apply {
+                    put("type", "position")
+                    put("played_ms", playedMs)
+                }.toString())
+            } catch (_: Exception) {}
+            mainHandler.postDelayed({ reportPosition(client) }, 500)
+        }
 
         wsThread = Thread {
             val client = WebSocketClient(
@@ -380,6 +502,7 @@ class ReadAloudController(
                         put("text", text)
                         put("engine", Settings.getTtsEngine(context))
                     }.toString())
+                    mainHandler.post { reportPosition(client) }
                 }
 
                 override fun onText(text: String) {

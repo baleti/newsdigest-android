@@ -176,3 +176,39 @@ def latest_digest() -> dict | None:
         return json.loads(p.read_text())
     except Exception:
         return None
+
+
+def list_digest_runs(limit: int = 30) -> list[dict]:
+    """Every dated run still on disk (build_digest_json.py already writes
+    and retention-rotates these - see its own rotate()), newest first, up
+    to `limit` runs. The app was only ever calling latest_digest() before,
+    so every previous run any of this retains was already being stored
+    and just never surfaced - confirmed live 2026-09-09 ("why am I only
+    seeing one digest... it should store them")."""
+    files = [f for f in DIGEST_DIR.glob("*.json") if f.stem != "latest"]
+    files.sort(key=lambda f: f.stem, reverse=True)  # run_id sorts chronologically
+    out = []
+    for f in files[:limit]:
+        try:
+            run = json.loads(f.read_text())
+        except Exception:
+            continue
+        if "digests" not in run:
+            # Pre-multi-topic format (single "markdown"/"references" pair
+            # directly on the run, no topic split) - wrap it so every
+            # caller can rely on "digests" always being present. Fixed
+            # 2026-09-09 after this crashed the app's history list with
+            # "No value for digests" on two leftover old-format files.
+            run = {
+                "date": run.get("date", f.stem[:10]),
+                "run_id": run.get("run_id", f.stem),
+                "digests": [{
+                    "topic": run.get("topic", "Digest"),
+                    "category": run.get("category", ""),
+                    "overview": run.get("overview", ""),
+                    "markdown": run.get("markdown", ""),
+                    "references": run.get("references", []),
+                }] if run.get("markdown") else [],
+            }
+        out.append(run)
+    return out

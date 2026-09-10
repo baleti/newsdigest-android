@@ -13,20 +13,33 @@ Expects the LLM's raw output on stdin split into topic sections marked
 like:
     ===TOPIC: Programming & Your Tools===
     ===CATEGORY: Programming===
+    ===OVERVIEW===
+    <short list of [label](#jump:<verbatim phrase from the body below>) links>
+    ===BODY===
     <markdown for this topic>
     ===TOPIC: Job Search===
     ===CATEGORY: Career===
+    ===OVERVIEW===
+    ...
+    ===BODY===
     <markdown for this topic>
 
-The CATEGORY line is optional (a run that produced it in an older format,
-or skipped it, still parses - it just comes back empty) - topic is the
-specific, today-only title; category is the coarse at-a-glance tag the
-app badges each entry with.
+CATEGORY is optional (a run from an older format, or one that skipped
+it, still parses - it just comes back empty) - topic is the specific,
+today-only title; category is the coarse at-a-glance tag the app badges
+each entry with. The OVERVIEW/BODY pair is likewise optional as a unit -
+without both markers present, the whole section is just body with an
+empty overview, same graceful degrade as CATEGORY. See generate-digest.sh's
+prompt for what the app expects inside an overview's jump-links: each
+phrase must be an exact, verbatim substring of the body text that
+follows, since the app locates it there with a plain string search (no
+fuzzy matching) to scroll to and briefly highlight.
 
 Writes ~/.cache/newsdigest-server/digest/<date>.json (and updates
 latest.json) as {"date": ..., "digests": [{"topic", "category",
-"markdown", "references"}, ...]}, then applies a retention curve: daily
-for 2 weeks, thinned to weekly through day 44, dropped after that.
+"overview", "markdown", "references"}, ...]}, then applies a retention
+curve: daily for 2 weeks, thinned to weekly through day 44, dropped
+after that.
 
 Generic and reusable across whatever sources are actually enabled -
 builds its link index from feed.py's already-merged items (respecting
@@ -44,6 +57,15 @@ import feed
 LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 TOPIC_RE = re.compile(r"^===TOPIC:\s*(.+?)\s*===\s*$", re.MULTILINE)
 CATEGORY_RE = re.compile(r"\A===CATEGORY:\s*(.+?)\s*===\s*\n?")
+# Optional overview block, see generate-digest.sh's prompt: a short list of
+# jump-links (#jump:<verbatim phrase from the body>) the app resolves by
+# plain substring search against the body text and uses to scroll/
+# highlight there. A generator run from before this existed, or one that
+# skipped it, has neither marker - OVERVIEW_RE just won't match, and the
+# whole thing falls back to an empty overview with the entire remainder
+# as body, same "missing marker degrades gracefully" pattern as CATEGORY.
+OVERVIEW_RE = re.compile(r"\A===OVERVIEW===\s*\n?")
+BODY_RE = re.compile(r"===BODY===\s*\n?")
 
 DAILY_TIER_DAYS = 14
 WEEKLY_TIER_DAYS = 44
@@ -72,17 +94,19 @@ def extract_references(markdown: str, link_index: dict) -> list:
     return refs
 
 
-def parse_topics(raw: str) -> list[tuple[str, str, str]]:
-    """Splits on ===TOPIC: name=== markers into (topic, category, markdown)
-    triples, pulling an optional immediately-following ===CATEGORY: ...===
-    line out of each body. A generator that ignored the marker format
+def parse_topics(raw: str) -> list[tuple[str, str, str, str]]:
+    """Splits on ===TOPIC: name=== markers into (topic, category, overview,
+    body) quadruples, pulling an optional immediately-following
+    ===CATEGORY: ...=== line and an optional ===OVERVIEW=== ... ===BODY===
+    pair out of each section. A generator that ignored the marker format
     entirely (no TOPIC markers found) still produces one nameless topic
-    rather than losing the output; one that skipped the CATEGORY line
-    just gets an empty category, not a parse failure."""
+    rather than losing the output; one that skipped CATEGORY or the
+    overview pair just gets an empty string for those, not a parse
+    failure."""
     matches = list(TOPIC_RE.finditer(raw))
     if not matches:
         stripped = raw.strip()
-        return [("Today", "", stripped)] if stripped else []
+        return [("Today", "", "", stripped)] if stripped else []
 
     sections = []
     for i, m in enumerate(matches):
@@ -97,9 +121,22 @@ def parse_topics(raw: str) -> list[tuple[str, str, str]]:
             category = cat_match.group(1).strip()
             body = body[cat_match.end():]
 
+        overview = ""
+        ov_match = OVERVIEW_RE.match(body)
+        if ov_match:
+            rest = body[ov_match.end():]
+            body_match = BODY_RE.search(rest)
+            if body_match:
+                overview = rest[:body_match.start()].strip()
+                body = rest[body_match.end():]
+            # else: an ===OVERVIEW=== with no matching ===BODY=== is
+            # treated as if neither marker were there - `body` is
+            # untouched, so the raw markers stay visible rather than
+            # silently eating the whole section as "overview".
+
         body = body.strip()
         if body:
-            sections.append((topic, category, body))
+            sections.append((topic, category, overview, body))
     return sections
 
 
@@ -142,10 +179,11 @@ def main():
         {
             "topic": topic,
             "category": category,
+            "overview": overview,
             "markdown": markdown,
             "references": extract_references(markdown, link_index),
         }
-        for topic, category, markdown in topics
+        for topic, category, overview, markdown in topics
     ]
     now = datetime.now()
     today_str = now.date().isoformat()

@@ -26,11 +26,6 @@
             android:label="Item" />
 
         <activity
-            android:name=".ArticleActivity"
-            android:exported="false"
-            android:label="Article" />
-
-        <activity
             android:name=".SettingsActivity"
             android:exported="false"
             android:label="Settings" />

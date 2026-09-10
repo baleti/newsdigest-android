@@ -13,6 +13,28 @@ from pathlib import Path
 
 _EXCEPTIONS_FILE = Path(__file__).parent / "word-acronyms.txt"
 
+# Bare domain mentions ("materialsdb.org", "phoronix.com") get read by both
+# TTS engines as if the "." were a sentence break -- confirmed live
+# 2026-09-10: "materialsdb.org" came out as "materialsdb" (pause) "org",
+# with "org" landing its own sentence-final prosody, instead of one fluent
+# "materialsdb dot org". split_sentences (server.py) requires whitespace
+# after the "." to treat it as a real sentence boundary, so this isn't a
+# sentence-splitting bug -- the underlying TTS model itself just always
+# treats "." as a hard stop regardless of surrounding whitespace. Spelling
+# it out as " dot " sidesteps that. A deliberately short, common-TLD
+# allowlist (not every valid TLD) keeps this from also firing on a genuine
+# decimal ("version 3.14") or a person's initials ("J.R. Smith") -- neither
+# of those is followed by a real TLD-shaped word.
+_DOMAIN_RE = re.compile(
+    r"\b([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\."
+    r"(com|org|net|io|co|gov|edu|ai|dev|app|info|biz|me|tv|xyz)\b",
+    re.IGNORECASE,
+)
+
+
+def expand_domains(text: str) -> str:
+    return _DOMAIN_RE.sub(lambda m: f"{m.group(1)} dot {m.group(2)}", text)
+
 _DEFAULT_EXCEPTIONS = {
     "NASA", "RADAR", "LASER", "NATO", "UNESCO", "SCUBA", "ASCII", "AIDS",
     "UNICEF", "OPEC", "INTERPOL", "SWAT", "ZIP", "GIF", "OK", "COVID",

@@ -7,8 +7,6 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -143,22 +141,15 @@ class TtsPlaybackService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentTitle: String = "News Digest"
     @Volatile private var lastSentenceText: String = "Preparing..."
-
-    // Shown as the media notification's large icon and the lock-screen/
-    // Bluetooth/Android-Auto media-session artwork - same app icon
-    // either way, decoded once and reused rather than re-decoding per
-    // notification update. There's no generated R class in this no-Gradle
-    // build (see build.sh - aapt2 link never emits one), so the resource
-    // is looked up by name at runtime instead of via R.mipmap.ic_launcher.
-    private val artBitmap: Bitmap? by lazy {
-        try {
-            val resId = resources.getIdentifier("ic_launcher", "mipmap", packageName)
-            if (resId == 0) null else BitmapFactory.decodeResource(resources, resId)
-        } catch (e: Exception) {
-            Log.e(TAG, "failed to load app icon for media art: ${e.message}")
-            null
-        }
-    }
+    // A rough word-count-based guess of the whole session's length, set
+    // by the caller right after startSession() (see setEstimatedDuration)
+    // - without it, METADATA_KEY_DURATION only ever reflected whatever
+    // had been synthesized so far, which (since the 30s lookahead cap)
+    // permanently lags a few seconds behind the real playback position
+    // instead of showing the article's actual total length - reported
+    // live 2026-09-09 as the system media notification's end-time being
+    // "empty, no end time as usual on the right".
+    private var estimatedTotalMs: Long = 0L
 
     /** All the places that change `playing` route through here instead of
      * assigning it directly, so HighlightListener.onPlayingChanged fires
@@ -287,6 +278,7 @@ class TtsPlaybackService : Service() {
         stopRequested = false
         idleSignaled = false
         sessionEnded = false
+        estimatedTotalMs = 0L
         synchronized(lock) {
             allSentences.clear()
             playIndex = 0
@@ -297,7 +289,18 @@ class TtsPlaybackService : Service() {
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, title)
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, 0L)
-                .apply { artBitmap?.let { putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) } }
+                // No METADATA_KEY_ALBUM_ART, and buildNotification() below
+                // sets no large icon either -- Android's system Media
+                // Player card (the quick-settings widget, not the
+                // notification itself) runs a Palette extraction against
+                // whichever of those bitmaps it can find (album art first,
+                // the notification's own large icon as a fallback) and
+                // tints its whole card -- big round play/pause button
+                // included -- with the dominant color it finds. The app's
+                // launcher icon (the bitmap both of those used to be) is
+                // gold/orange, so that's exactly the "ugly orange"
+                // reported live 2026-09-09 -- removing only one of the two
+                // sources wasn't enough on its own, confirmed live.
                 .build(),
         )
         try {
@@ -318,8 +321,24 @@ class TtsPlaybackService : Service() {
         mediaSession?.setMetadata(
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, totalMs)
-                .apply { artBitmap?.let { putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) } }
+                .putLong(MediaMetadata.METADATA_KEY_DURATION, maxOf(estimatedTotalMs, totalMs))
+                // No album art -- see startSession()'s comment above.
+                .build(),
+        )
+    }
+
+    /** Sets an upfront estimate of the whole session's total length (see
+     * estimatedTotalMs's own doc) - call right after startSession(), once
+     * the caller knows the full text but before any real audio has come
+     * back. Only ever raises what's shown: enqueueSentence() above takes
+     * the max of this and the real running total, so a session that ends
+     * up longer than guessed still grows past the estimate correctly. */
+    fun setEstimatedDuration(ms: Long) {
+        estimatedTotalMs = ms
+        mediaSession?.setMetadata(
+            MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
+                .putLong(MediaMetadata.METADATA_KEY_DURATION, ms)
                 .build(),
         )
     }
@@ -333,6 +352,14 @@ class TtsPlaybackService : Service() {
 
     fun pause() {
         setPositionAnchor(estimatedPositionMs(), false)
+        // Freeze the highlight anchor at the position it had actually
+        // reached (same rebase setPlaybackSpeed() does before swapping
+        // speed) - highlightAnchorAtNanos is deliberately left stale here,
+        // not reset to now; the highlighter Runnable stops reading either
+        // field entirely while paused (see its own doc), so the stale
+        // value is harmless and resume() is what re-bases it.
+        highlightAnchorMs = highlightAnchorMs +
+            ((System.nanoTime() - highlightAnchorAtNanos) / 1_000_000.0 * playbackSpeed).toLong()
         setPlaying(false)
         audioTrack?.pause()
         updatePlaybackState(PlaybackState.STATE_PAUSED)
@@ -342,6 +369,11 @@ class TtsPlaybackService : Service() {
     fun resume() {
         requestAudioFocus()
         setPositionAnchor(estimatedPositionMs(), true)
+        // Restart the wall-clock baseline from right now, so the elapsed-
+        // time delta the highlighter Runnable computes on its very next
+        // tick doesn't include however long playback was actually paused
+        // for (see pause()'s comment).
+        highlightAnchorAtNanos = System.nanoTime()
         setPlaying(true)
         audioTrack?.play()
         updatePlaybackState(PlaybackState.STATE_PLAYING)
@@ -531,6 +563,25 @@ class TtsPlaybackService : Service() {
                 var idx = 0
                 override fun run() {
                     if (stopRequested || seekGeneration != myGeneration) return
+                    // The write loop below stalls on `!playing` and simply
+                    // stops consuming audio while paused, but this Runnable
+                    // is on its own postDelayed clock and was computing
+                    // elapsed time from raw wall-clock nanoTime() deltas
+                    // regardless of pause state - confirmed live 2026-09-10:
+                    // pausing left the word highlight silently still
+                    // advancing (in lockstep with real time, not audio)
+                    // until the next sentence's onSentenceStart reset the
+                    // anchor and it "caught back up". While paused, just
+                    // keep polling without advancing - pause()/resume()
+                    // rebase highlightAnchorMs/highlightAnchorAtNanos (same
+                    // freeze-then-restart pattern setPlaybackSpeed already
+                    // uses) so the very next tick after resume continues
+                    // from exactly where this left off, instead of jumping
+                    // forward by however long the pause lasted.
+                    if (!playing) {
+                        mainHandler.postDelayed(this, HIGHLIGHT_TICK_MS)
+                        return
+                    }
                     // Reads playbackSpeed live (not captured at sentence
                     // start) so a mid-sentence speed change takes effect
                     // immediately - setPlaybackSpeed() rebases the anchor
@@ -655,7 +706,14 @@ class TtsPlaybackService : Service() {
             .setContentTitle(currentTitle)
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .apply { artBitmap?.let { setLargeIcon(it) } }
+            // No large icon either -- Android 13+'s Media Controls card
+            // (the quick-settings widget) falls back to THIS bitmap for
+            // its Palette-based theming whenever MediaMetadata has no
+            // album art, so leaving it here still fed the exact same
+            // gold/orange launcher icon into the same "ugly orange"
+            // theming this was meant to remove (see the metadata comment
+            // above, and confirmed live 2026-09-09 - removing only the
+            // metadata's copy wasn't enough on its own).
             .setOngoing(true)
             .addAction(playPauseAction)
             .addAction(stopAction)

@@ -35,6 +35,7 @@ data class DigestEntry(
     val runId: String,
     val topic: String,
     val category: String,
+    val overview: String,
     val markdown: String,
     val references: JSONArray,
 )
@@ -175,6 +176,13 @@ class MainActivity : Activity() {
         } else {
             chosen.joinToString("\n\n") { "**${it.topic}**\n\n${it.markdown}" }
         }
+        // Was missing entirely - confirmed live 2026-09-10 as why "Read
+        // aloud" from this multi-select flow skipped straight to the body
+        // with no spoken summary, even after DetailActivity.toggleReadAloud()
+        // was fixed to prepend it: this Intent never carried an "overview"
+        // extra at all, so loadDigest() always saw it as blank regardless
+        // of what that fix did downstream.
+        val combinedOverview = chosen.joinToString("\n\n") { it.overview }.trim()
         val combinedRefs = JSONArray()
         for (e in chosen) for (i in 0 until e.references.length()) combinedRefs.put(e.references.get(i))
 
@@ -190,6 +198,7 @@ class MainActivity : Activity() {
             // I'll come back to chat about" one.
             putExtra("runId", chosen[0].runId)
             putExtra("topic", combinedTopic)
+            putExtra("overview", combinedOverview)
             putExtra("markdown", combinedMarkdown)
             putExtra("references", combinedRefs.toString())
             putExtra("autoReadAloud", true)
@@ -225,16 +234,33 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    /** Every stored run, not just the latest one - server.py's
+     * /feed/digests/history reads whatever build_digest_json.py's own
+     * retention curve has kept on disk (daily for 2 weeks, thinned to
+     * weekly through day 44). The old single-run /feed/digests call this
+     * replaced only ever showed the newest run, even though older ones
+     * were already being stored the whole time (reported live 2026-09-09:
+     * "why am I seeing only one digest... it should store them"). */
     private fun fetchDigests(): List<DigestEntry> {
         val out = mutableListOf<DigestEntry>()
-        try {
-            val body = JSONObject(ApiClient.get(this, "/feed/digests"))
-            val date = body.getString("date")
-            // Absent on a digest generated before this field existed (no
-            // regeneration has happened since) - chat just won't be able to
-            // resume/persist for those stale entries until the next run.
-            val runId = body.optString("run_id", "")
-            val digestsArray = body.getJSONArray("digests")
+        val body = JSONObject(ApiClient.get(this, "/feed/digests/history"))
+        val runs = body.getJSONArray("runs")
+        for (r in 0 until runs.length()) {
+            val run = runs.getJSONObject(r)
+            val date = run.getString("date")
+            // Absent on a digest generated before this field existed - chat
+            // just won't be able to resume/persist for those stale entries.
+            val runId = run.optString("run_id", "")
+            val digestsArray = run.getJSONArray("digests")
+            // Only the current one-continuous-narrative "general overview"
+            // format is wanted here - a run that split into several
+            // narrow, topically-clustered digests (an older generator
+            // design: "Programming", "Architecture", etc.) is exactly what
+            // the user asked to stop seeing (2026-09-09: "only keep the
+            // overview articles, remove the ones generated topically").
+            // The current generate-digest.sh always writes exactly one
+            // digest per run, so more than one is unambiguously old-format.
+            if (digestsArray.length() != 1) continue
             for (i in 0 until digestsArray.length()) {
                 val d = digestsArray.getJSONObject(i)
                 out.add(DigestEntry(
@@ -242,12 +268,11 @@ class MainActivity : Activity() {
                     runId = runId,
                     topic = d.optString("topic").ifBlank { "Today" },
                     category = d.optString("category"),
+                    overview = d.optString("overview"),
                     markdown = d.getString("markdown"),
                     references = d.optJSONArray("references") ?: JSONArray(),
                 ))
             }
-        } catch (e: ApiClient.ApiException) {
-            if (e.code != 404) throw e // 404 just means no digest generated yet - fine
         }
         return out
     }
@@ -258,6 +283,7 @@ class MainActivity : Activity() {
             putExtra("date", entry.date)
             putExtra("runId", entry.runId)
             putExtra("topic", entry.topic)
+            putExtra("overview", entry.overview)
             putExtra("markdown", entry.markdown)
             putExtra("references", entry.references.toString())
         }
@@ -301,7 +327,17 @@ class MainActivity : Activity() {
                 setTextColor(if (isSelected) Theme.primary else Theme.onBackground)
             }
             val subtitle = TextView(this@MainActivity).apply {
-                text = entry.date
+                // run_id's trailing slot ("-07"/"-17", see
+                // build_digest_json.py) maps straight to the two fixed
+                // generation times (newsdigest-digest.timer) - a legacy
+                // entry with no run_id, or an unrecognized slot, just
+                // shows the date alone rather than guessing.
+                val timeLabel = when {
+                    entry.runId.endsWith("-07") -> " · 7am"
+                    entry.runId.endsWith("-17") -> " · 5pm"
+                    else -> ""
+                }
+                text = entry.date + timeLabel
                 textSize = 12f
                 setTextColor(Theme.muted)
                 setPadding(0, Theme.dp(this@MainActivity, 4), 0, Theme.dp(this@MainActivity, 6))
