@@ -3,11 +3,15 @@ package dev.local.newsdigest
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PorterDuff
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
+import java.util.Locale
 
 /**
  * Sticky media-style control row shown for the whole time a read-aloud
@@ -45,9 +49,36 @@ class PlayerControlBar(
     // easy to lose track of the live position while scrolling around.
     // Kept in sync with claude-agents-android's copy of this file.
     onLocate: () -> Unit = {},
+    // Scrubber - asked for explicitly 2026-09-10 ("scrubback... with
+    // total length at the right end and current position... possible to
+    // change position on that line to seek"). Polled on a short internal
+    // tick (only while shown) rather than pushed, so this stays a self-
+    // contained UI component; onSeek fires once the user releases a
+    // drag, with the dragged fraction (0f..1f) through the whole text -
+    // ReadAloudController.seekToFraction is the intended receiver.
+    private val getPosition: () -> Long = { 0L },
+    private val getDuration: () -> Long = { 0L },
+    private val onSeek: (Float) -> Unit = {},
 ) {
     private val playPauseButton: PlayPauseImageView
     private val speedButton: TextView
+    private val seekBar: SeekBar
+    private val positionLabel: TextView
+    private val durationLabel: TextView
+    private var userIsDragging = false
+    private val tickHandler = Handler(Looper.getMainLooper())
+    private val tick = object : Runnable {
+        override fun run() {
+            if (!userIsDragging) {
+                val pos = getPosition()
+                val dur = getDuration()
+                if (dur > 0) seekBar.progress = ((pos * 1000) / dur).toInt().coerceIn(0, 1000)
+                positionLabel.text = formatMs(pos)
+                durationLabel.text = formatMs(dur)
+            }
+            tickHandler.postDelayed(this, 500)
+        }
+    }
     val view: LinearLayout
 
     init {
@@ -70,22 +101,61 @@ class PlayerControlBar(
             setOnClickListener { onClick() }
         }
 
-        val prevSectionButton = iconImageView(context, "ic_prev_section", 18) { onPreviousSection() }
-        val rewindButton = iconImageView(context, "ic_rewind", 22) { onRewind() }
+        // Sizes bumped up a second time -- reported live 2026-09-10, after
+        // the codex-icon swap-in, still "too small" at the original
+        // 14-22dp range this row used with the earlier hand-drawn icons.
+        val prevSectionButton = iconImageView(context, "ic_prev_section", 26) { onPreviousSection() }
+        val rewindButton = iconImageView(context, "ic_rewind", 32) { onRewind() }
         playPauseButton = PlayPauseImageView(context) { onPlayPause() }
-        val forwardButton = iconImageView(context, "ic_forward", 22) { onForward() }
-        val nextSectionButton = iconImageView(context, "ic_next_section", 18) { onNextSection() }
-        val locateButton = iconImageView(context, "ic_locate", 20) { onLocate() }
+        val forwardButton = iconImageView(context, "ic_forward", 32) { onForward() }
+        val nextSectionButton = iconImageView(context, "ic_next_section", 26) { onNextSection() }
+        val locateButton = iconImageView(context, "ic_locate", 28) { onLocate() }
         speedButton = iconButton("1x") { onSpeedClick(speedButton) }
 
-        view = LinearLayout(context).apply {
+        positionLabel = TextView(context).apply {
+            textSize = 11f
+            setTextColor(Theme.muted)
+            text = "0:00"
+        }
+        durationLabel = TextView(context).apply {
+            textSize = 11f
+            setTextColor(Theme.muted)
+            text = "0:00"
+        }
+        seekBar = SeekBar(context).apply {
+            max = 1000
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
+                    if (fromUser) positionLabel.text = formatMs((progress.toLong() * getDuration()) / 1000)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar) {
+                    userIsDragging = true
+                }
+                override fun onStopTrackingTouch(sb: SeekBar) {
+                    userIsDragging = false
+                    onSeek(sb.progress / 1000f)
+                }
+            })
+        }
+        val scrubberRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Theme.surface)
+            val padH = Theme.dp(context, 10)
+            setPadding(padH, 0, padH, 0)
+            addView(positionLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            val seekParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            seekParams.marginStart = Theme.dp(context, 6)
+            seekParams.marginEnd = Theme.dp(context, 6)
+            addView(seekBar, seekParams)
+            addView(durationLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+
+        val iconRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             val padH = Theme.dp(context, 6)
             val padV = Theme.dp(context, 3)
             setPadding(padH, padV, padH, padV)
-            visibility = View.GONE
             addView(prevSectionButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(rewindButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(playPauseButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -94,10 +164,32 @@ class PlayerControlBar(
             addView(locateButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(speedButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
+
+        view = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Theme.surface)
+            visibility = View.GONE
+            addView(scrubberRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(iconRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
     }
 
-    fun show() { view.visibility = View.VISIBLE }
-    fun hide() { view.visibility = View.GONE }
+    private fun formatMs(ms: Long): String {
+        val totalSec = (ms / 1000).coerceAtLeast(0)
+        val m = totalSec / 60
+        val s = totalSec % 60
+        return String.format(Locale.US, "%d:%02d", m, s)
+    }
+
+    fun show() {
+        view.visibility = View.VISIBLE
+        tickHandler.removeCallbacks(tick)
+        tickHandler.post(tick)
+    }
+    fun hide() {
+        view.visibility = View.GONE
+        tickHandler.removeCallbacks(tick)
+    }
     fun setPlaying(playing: Boolean) { playPauseButton.setPlaying(playing) }
     fun setSpeed(speed: Float) { speedButton.text = SpeedPicker.formatSpeed(speed) }
 }
@@ -140,7 +232,7 @@ private class PlayPauseImageView(context: Context, onClick: () -> Unit) : ImageV
     init {
         scaleType = ScaleType.FIT_CENTER
         adjustViewBounds = true
-        val sizePx = Theme.dp(context, 22)
+        val sizePx = Theme.dp(context, 34)
         maxWidth = sizePx
         maxHeight = sizePx
         minimumHeight = Theme.dp(context, 44)

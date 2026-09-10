@@ -385,6 +385,15 @@ class TtsPlaybackService : Service() {
      * build relative seek ("skip back/forward 15s") on top of seekTo(). */
     fun getPositionMs(): Long = estimatedPositionMs()
 
+    // Same "whichever is bigger" duration the media session's own metadata
+    // already shows (see enqueueSentence/setEstimatedDuration) - exposed
+    // here too so an in-app scrubber can show the identical number rather
+    // than recomputing its own, separately-drifting guess.
+    fun getDisplayDurationMs(): Long {
+        val real = synchronized(lock) { allSentences.sumOf { it.durationMs } }
+        return maxOf(estimatedTotalMs, real)
+    }
+
     /** True from startSession() until the session genuinely ends (queue
      * drains with nothing more coming, or stopAll()) -- stays true across
      * a pause, unlike isPlaying(). A controller that just (re)bound uses
@@ -722,6 +731,20 @@ class TtsPlaybackService : Service() {
                     .setMediaSession(mediaSession?.sessionToken)
                     .setShowActionsInCompactView(0, 1),
             )
+            // Android's own media notification template lets the user
+            // swipe it away even with setOngoing(true) (a deliberate
+            // system-UI change so a "stuck" media notification can always
+            // be dismissed) - that swipe carries no default effect on the
+            // service, though, so audio kept playing invisibly with no
+            // notification left to control it (reported live 2026-09-10:
+            // "swiped closed media player... it kept playing"). Routes the
+            // swipe through the same PAUSE action the notification's own
+            // button uses - stops the audio immediately, same as the user
+            // wanted, but (unlike routing it to STOP) leaves the session
+            // paused rather than ended, so the position is still there to
+            // resume and the notification reappears in a paused state
+            // instead of vanishing into an orphaned foreground service.
+            .setDeleteIntent(actionPendingIntent(ACTION_PAUSE))
             .build()
     }
 

@@ -268,6 +268,26 @@ class ReadAloudController(
     fun currentReadingOffset(): Int? =
         if (!active) null else (currentHighlightStart ?: currentSentenceStartOffset)
 
+    /** Current playback position in ms, for a scrubber to show/drive -
+     * asked for explicitly 2026-09-10. Pass-through to the service so a
+     * caller never needs its own reference to it. */
+    fun getPositionMs(): Long = ttsService?.getPositionMs() ?: 0L
+
+    /** Same "best guess, corrected once real audio exceeds it" total the
+     * media session's own notification/lock-screen duration already
+     * shows (see TtsPlaybackService.getDisplayDurationMs). */
+    fun getDurationMs(): Long = ttsService?.getDisplayDurationMs() ?: 0L
+
+    /** Scrubber drag-to-seek - asked for explicitly 2026-09-10. `fraction`
+     * is 0f..1f through the whole text (a scrubber has no way to know
+     * character offsets, only a position along the bar), converted to a
+     * character offset and handed to the exact same abandon-and-restart
+     * mechanism skipAheadTo already provides for word-tap-seek. */
+    fun seekToFraction(fraction: Float) {
+        if (!active || fullText.isEmpty()) return
+        skipAheadTo((fraction.coerceIn(0f, 1f) * fullText.length).toInt())
+    }
+
     /** title is what shows in the media notification while this plays.
      * `text` can be plain, or a Spannable (e.g. MarkdownRenderer.render()'s
      * output) whose spans - link clicks, bold styling - carry over into

@@ -64,6 +64,7 @@ class DetailActivity : Activity() {
     private lateinit var playerBar: PlayerControlBar
     private lateinit var readAloudButton: Button
     private lateinit var resumeButton: Button
+    private lateinit var resumePreviewView: TextView
     // Stable per-content id for ReadAloudPositionStore - a digest run's
     // own runId+topic when there is one (stays valid across app restarts,
     // unlike this screen's own instance), else the item's link (the one
@@ -215,6 +216,22 @@ class DetailActivity : Activity() {
             onPlayingChanged = { playing ->
                 isPlaying = playing
                 playerBar.setPlaying(playing)
+                // Fires for a pause from ANY source (in-app, the system
+                // notification's own button, swiping the notification -
+                // see TtsPlaybackService's delete-intent doc, audio focus
+                // loss), unlike playerBar's onPlayPause below which only
+                // ever sees an in-app tap - confirmed live 2026-09-10 as
+                // the reason "Resume" started over from the beginning
+                // after pausing via the notification/swipe path: nothing
+                // saved a position at all in that case, since the only
+                // other save points (this activity's periodic tick, and
+                // the in-app pause handler) either hadn't ticked yet or
+                // never ran for a trigger that didn't come through them.
+                if (!playing) {
+                    readAloud.currentReadingOffset()?.let {
+                        ReadAloudPositionStore.set(this, readAloudPositionKey, it)
+                    }
+                }
             },
         )
         readAloud.bind()
@@ -251,19 +268,9 @@ class DetailActivity : Activity() {
             this,
             onPreviousSection = { readAloud.skipToPreviousSection() },
             onRewind = { readAloud.seekRelative(-15_000) },
-            onPlayPause = {
-                if (isPlaying) {
-                    readAloud.pause()
-                    // Save immediately on pause, not just on the next 5s
-                    // tick - pausing is exactly the moment a position is
-                    // most likely to actually matter for resuming later.
-                    readAloud.currentReadingOffset()?.let {
-                        ReadAloudPositionStore.set(this, readAloudPositionKey, it)
-                    }
-                } else {
-                    readAloud.resume()
-                }
-            },
+            // Position-saving itself now lives in onPlayingChanged above,
+            // which fires for a pause from any source, not just this one.
+            onPlayPause = { if (isPlaying) readAloud.pause() else readAloud.resume() },
             onForward = { readAloud.seekRelative(15_000) },
             onNextSection = { readAloud.skipToNextSection() },
             onSpeedClick = { anchor ->
@@ -273,6 +280,9 @@ class DetailActivity : Activity() {
                 }
             },
             onLocate = { scrollToCurrentReading() },
+            getPosition = { readAloud.getPositionMs() },
+            getDuration = { readAloud.getDurationMs() },
+            onSeek = { fraction -> readAloud.seekToFraction(fraction) },
         )
         outer.addView(playerBar.view)
 
@@ -374,16 +384,36 @@ class DetailActivity : Activity() {
         }
         val readAloudButtonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 0, 0, dp(12))
         }
         readAloudButtonRow.addView(readAloudButton)
         val resumeButtonParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         resumeButtonParams.marginStart = dp(10)
         readAloudButtonRow.addView(resumeButton, resumeButtonParams)
 
+        // Shows what Resume will actually pick up from - asked for
+        // explicitly 2026-09-10 ("it would be good if resume showed
+        // where it was, where it will start from"). Text set in
+        // updateReadAloudButtons.
+        resumePreviewView = TextView(this).apply {
+            textSize = 12f
+            setTypeface(null, Typeface.ITALIC)
+            setTextColor(Theme.onSurfaceVariant)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            visibility = View.GONE
+        }
+        val readAloudSection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(12))
+        }
+        readAloudSection.addView(readAloudButtonRow)
+        val resumePreviewParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        resumePreviewParams.topMargin = dp(6)
+        readAloudSection.addView(resumePreviewView, resumePreviewParams)
+
         contentContainer.addView(titleView)
         contentContainer.addView(subtitleView)
-        contentContainer.addView(readAloudButtonRow)
+        contentContainer.addView(readAloudSection)
         contentContainer.addView(overviewView)
         overviewSpacer = spacer(16).also { it.visibility = View.GONE }
         contentContainer.addView(overviewSpacer)
@@ -694,10 +724,29 @@ class DetailActivity : Activity() {
         if (saved != null) {
             readAloudButton.text = "Start again"
             resumeButton.visibility = View.VISIBLE
+            resumePreviewView.text = "Resumes at: “${resumePreviewSnippet(saved)}…”"
+            resumePreviewView.visibility = View.VISIBLE
         } else {
             readAloudButton.text = "Read aloud"
             resumeButton.visibility = View.GONE
+            resumePreviewView.visibility = View.GONE
         }
+    }
+
+    // Same combined-and-rendered text toggleReadAloud() builds for actual
+    // playback, minus the real link spans - only the plain characters
+    // matter here, for indexing into it at a saved char offset.
+    private fun readAloudPlainText(): String = if (isDigest) {
+        val combined = if (rawOverview.isNotBlank()) "$rawOverview\n\n$rawContent" else rawContent
+        MarkdownRenderer.render(combined) {}.toString()
+    } else {
+        rawContent
+    }
+
+    private fun resumePreviewSnippet(offset: Int): String {
+        val text = readAloudPlainText()
+        val clamped = offset.coerceIn(0, text.length)
+        return text.substring(clamped).trimStart().take(90)
     }
 
     // ------------------------------------------------------------ chat
@@ -935,6 +984,24 @@ class DetailActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // Without this, positionSaveTick kept running against this
+        // instance's own (now going away) ReadAloudController even after
+        // the screen closed - confirmed live 2026-09-10 as part of a
+        // reported "Resume started from the beginning" bug: reopening the
+        // same article rebinds a NEW controller as the service's live
+        // listener, which freezes this old one's currentReadingOffset()
+        // at whatever it last saw, and this leaked tick was still there to
+        // periodically write that frozen, increasingly-stale offset back
+        // over whatever the new screen was correctly saving. One last
+        // save here too, on the position this controller actually knows
+        // right now, so closing the screen mid-read doesn't lose up to
+        // the last 5s of progress the periodic tick hadn't caught yet.
+        mainHandler.removeCallbacks(positionSaveTick)
+        if (readAloud.isActive()) {
+            readAloud.currentReadingOffset()?.let {
+                ReadAloudPositionStore.set(this, readAloudPositionKey, it)
+            }
+        }
         readAloud.unbind()
         agentChat?.close()
         if (chatTtsBound) {
