@@ -280,18 +280,28 @@ STT_MAX_BYTES = 16_000 * 2 * 120  # 16kHz, 16-bit mono, 2 minutes - generous for
 
 
 class WhisperEngine:
-    def __init__(self, name: str, model_size: str, device: str, compute_type: str):
+    # device_index matters here specifically because this VM has TWO
+    # GPUs (confirmed live 2026-09-20 while chasing "is there anything
+    # we can do to speed up the transcription") - GPU 0 already has
+    # Chatterbox loaded on it, GPU 1 sits idle. Defaults to 0 so a
+    # device="cpu" engine (device_index is simply unused then) and any
+    # future device="cuda" caller that doesn't care both keep working
+    # unchanged; the GPU engine below passes 1 explicitly to land on
+    # the otherwise-idle card instead of contending with Chatterbox.
+    def __init__(self, name: str, model_size: str, device: str, compute_type: str, device_index: int = 0):
         self.name = name
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
+        self.device_index = device_index
         self.ready = False
         self._model = None
         self._lock = threading.Lock()
 
     def load(self):
         from faster_whisper import WhisperModel
-        self._model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
+        kwargs = {"device_index": self.device_index} if self.device == "cuda" else {}
+        self._model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type, **kwargs)
         self.ready = True
 
     def transcribe(self, samples: np.ndarray) -> str:
@@ -317,9 +327,21 @@ class WhisperEngine:
 # ~9GB free with both sizes plus Kokoro plus Chatterbox loaded) that
 # this pairing is fine; medium is kept as the other apps' own default,
 # re-add large here too if ever actually needed for comparison.
+#
+# whisper-medium-gpu added the same day, right after: the CPU-only
+# constraint here was never actually a hard CUDA-version wall the way
+# host3's original investigation concluded - confirmed live that the
+# "libcublas.so.12 not found" error was just ctranslate2 not being
+# pointed at the nvidia-cublas-cu12 pip package this venv already has
+# installed (needs LD_LIBRARY_PATH set at process launch, see
+# ai1-tts-stt-server.service.example). Once that's set, GPU medium
+# transcribes in ~0.5-0.6s regardless of clip length (vs ~13s on CPU) -
+# device_index=1 specifically to land on the second, otherwise-idle
+# GPU in this VM rather than contending with Chatterbox on GPU 0.
 STT_ENGINES = {
     "whisper-small-cpu": WhisperEngine("whisper-small-cpu", "small", "cpu", "int8"),
     "whisper-medium-cpu": WhisperEngine("whisper-medium-cpu", "medium", "cpu", "int8"),
+    "whisper-medium-gpu": WhisperEngine("whisper-medium-gpu", "medium", "cuda", "int8", device_index=1),
 }
 
 

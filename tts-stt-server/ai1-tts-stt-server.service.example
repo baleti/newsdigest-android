@@ -14,6 +14,15 @@ Environment=HF_HOME=/home/user/.cache/ai1-tts-stt-server/hf
 Environment=TTS_STT_BIND_HOST=0.0.0.0
 Environment=TTS_STT_BIND_PORT=8100
 Environment=TTS_STT_ALLOWED_SUBNET=192.168.1.211/32
+# Required for whisper-medium-gpu (device="cuda") to actually find
+# libcublas.so.12/cudnn at runtime - the nvidia-cublas-cu12/nvidia-cudnn-cu12
+# pip packages are already installed in this venv (torch/Chatterbox's own
+# dependencies), ctranslate2 just doesn't know to look in their
+# site-packages location on its own. Without this, GPU Whisper fails
+# with "Library libcublas.so.12 is not found or cannot be loaded" at
+# inference time (model construction alone succeeds either way, which
+# is a red herring - the real failure only shows up on first transcribe).
+Environment=LD_LIBRARY_PATH=/home/user/.venvs/tts-stt-server/lib/python3.13/site-packages/nvidia/cublas/lib:/home/user/.venvs/tts-stt-server/lib/python3.13/site-packages/nvidia/cudnn/lib
 WorkingDirectory=/home/user/tts-stt-server
 ExecStart=/home/user/.venvs/tts-stt-server/bin/python3 server.py
 Restart=on-failure
