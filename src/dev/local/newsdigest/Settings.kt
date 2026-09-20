@@ -58,13 +58,4 @@ object Settings {
     }
 
     fun getTtsVoice(context: Context): String? = prefs(context).getString("tts_voice", null)
-
-    // Which speech-to-text model /stt/transcribe should use (see
-    // server.py's STT_ENGINES) -- exposed as a settings choice purely for
-    // testing/comparing the three while this feature is new (2026-09-12).
-    fun setSttModel(context: Context, model: String) {
-        prefs(context).edit().putString("stt_model", model).apply()
-    }
-
-    fun getSttModel(context: Context): String = prefs(context).getString("stt_model", "whisper-medium-cpu") ?: "whisper-medium-cpu"
 }
