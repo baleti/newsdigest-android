@@ -1,0 +1,23 @@
+[Unit]
+Description=ai1 TTS/STT server (Kokoro + Chatterbox + faster-whisper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+Group=user
+# %h resolves against the *manager's* (root, PID1) home for a system unit,
+# not User='s - confirmed live 2026-09-19 (landed /root/.venvs/... and
+# failed with 203/EXEC) - hardcoded paths instead.
+Environment=HF_HOME=/home/user/.cache/ai1-tts-stt-server/hf
+Environment=TTS_STT_BIND_HOST=0.0.0.0
+Environment=TTS_STT_BIND_PORT=8100
+Environment=TTS_STT_ALLOWED_SUBNET=192.168.1.211/32
+WorkingDirectory=/home/user/tts-stt-server
+ExecStart=/home/user/.venvs/tts-stt-server/bin/python3 server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

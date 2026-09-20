@@ -9,8 +9,9 @@
 set -e
 cd "$(dirname "$0")"
 
-ANDROID_JAR="${ANDROID_JAR:-$HOME/mediabridge/sdk/platform37/android-37.1/android.jar}"
-KOTLIN_STDLIB="${KOTLIN_STDLIB:-$PREFIX/opt/kotlin/lib/kotlin-stdlib.jar}"
+ANDROID_JAR="${ANDROID_JAR:-$HOME/.local/share/android-sdk/platforms/android-34/android.jar}"
+KOTLIN_STDLIB="${KOTLIN_STDLIB:-${PREFIX:+$PREFIX/opt/kotlin/lib/kotlin-stdlib.jar}}"
+KOTLIN_STDLIB="${KOTLIN_STDLIB:-/usr/share/kotlin/lib/kotlin-stdlib.jar}"
 AAPT2="${AAPT2:-aapt2}"
 KOTLINC="${KOTLINC:-kotlinc}"
 D8="${D8:-d8}"

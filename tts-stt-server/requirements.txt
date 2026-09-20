@@ -1,0 +1,23 @@
+# Core server
+fastapi
+uvicorn[standard]
+
+# Kokoro TTS engine - CPU-only, no GPU required.
+kokoro-onnx
+soundfile
+
+# Chatterbox TTS engine - needs the CUDA GPU passed through to this VM
+# (03:00.x, assigned 2026-09-19). torch bundles its own CUDA runtime, so
+# no separate system CUDA toolkit install is required beyond the NVIDIA
+# kernel driver itself.
+chatterbox-tts
+
+# resemble-perth (a chatterbox-tts dependency) still uses the removed
+# pkg_resources API.
+setuptools<81
+
+# Speech-to-text (voice dictation). faster-whisper (CTranslate2), CPU-only
+# on purpose - see server.py's WhisperEngine comment for why (a
+# ctranslate2/cuBLAS version-matching issue, not something moving hosts
+# fixes).
+faster-whisper

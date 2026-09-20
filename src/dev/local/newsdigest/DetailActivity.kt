@@ -2,11 +2,15 @@ package dev.local.newsdigest
 
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.net.Uri
+import android.graphics.Color
+import android.graphics.PorterDuff
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
@@ -20,6 +24,7 @@ import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -46,6 +51,9 @@ private const val JUMP_LINK_PREFIX = "#jump:"
  * against the same running service instance, so this isn't two services.
  */
 class DetailActivity : Activity() {
+
+    companion object {
+    }
 
     private lateinit var contentContainer: LinearLayout
     private lateinit var titleView: TextView
@@ -256,11 +264,13 @@ class DetailActivity : Activity() {
         playerBar = PlayerControlBar(
             this,
             onPreviousSection = { readAloud.skipToPreviousSection() },
-            onRewind = { readAloud.seekRelative(-15_000) },
+            // 10s, not 15 -- asked for explicitly 2026-09-20 ("these were
+            // supposed to nudge playback by only small 10 seconds").
+            onRewind = { readAloud.seekRelative(-10_000) },
             // Position-saving itself now lives in onPlayingChanged above,
             // which fires for a pause from any source, not just this one.
             onPlayPause = { if (isPlaying) readAloud.pause() else readAloud.resume() },
-            onForward = { readAloud.seekRelative(15_000) },
+            onForward = { readAloud.seekRelative(10_000) },
             onNextSection = { readAloud.skipToNextSection() },
             onSpeedClick = { anchor ->
                 SpeedPicker.show(this, anchor, readAloud.getSpeed()) { speed ->
@@ -334,6 +344,19 @@ class DetailActivity : Activity() {
             setLineSpacing(dp(4).toFloat(), 1f)
             LinkTapHandler.attach(this)
             setLinkTextColor(Theme.linkColor)
+            // Long-press (not the single tap LinkTapHandler already owns
+            // above, so the two never fight over the same gesture) opens
+            // a copy menu -- asked for explicitly 2026-09-20: "like long
+            // press on messages in claude agents". This TextView isn't
+            // text-selectable (unlike claude-agents' message bubbles), so
+            // there's no competing platform text-selection long-press to
+            // work around here either.
+            setOnLongClickListener {
+                Theme.showMenu(this@DetailActivity, this, listOf("Copy to clipboard")) { choice ->
+                    if (choice == "Copy to clipboard") copyArticleToClipboard()
+                }
+                true
+            }
         }
         // Only shown to START a read -- once playing, playerBar (rewind/
         // play-pause/forward/prev/next/speed) plus the system
@@ -659,6 +682,19 @@ class DetailActivity : Activity() {
         scrollView.smoothScrollTo(0, (y - dp(24)).coerceAtLeast(0))
     }
 
+    // Long-press-on-article "Copy to clipboard" (asked for explicitly
+    // 2026-09-20) - plain text, title included, markdown stripped, same
+    // title+overview+body composition toggleReadAloud() speaks so what
+    // you get here matches what you'd hear.
+    private fun copyArticleToClipboard() {
+        val body = if (isDigest && rawOverview.isNotBlank()) "$rawOverview\n\n$rawContent" else rawContent
+        val withTitle = if (sourceTitle.isNotBlank()) "$sourceTitle\n\n$body" else body
+        val plain = MarkdownStrip.strip(withTitle)
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Article text", plain))
+        Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+    }
+
     private fun toggleReadAloud(resumeOffset: Int? = null) {
         if (readAloud.isActive()) {
             readAloud.stop()
@@ -678,15 +714,19 @@ class DetailActivity : Activity() {
             // in sync for sentences containing links, bold, etc. instead
             // of silently failing to match (confirmed live before this fix).
             //
-            // The overview is prepended here (asked for explicitly
-            // 2026-09-10) so playback opens with the same spoken summary
-            // the overview paragraph gives a sighted reader, instead of
-            // jumping straight into the full narrative with no framing -
-            // it was never part of rawContent (loadDigest keeps it
-            // separate, see rawOverview's own doc), so without this it
-            // never reached the TTS stream at all.
+            // The title, then the overview, are both prepended here (title
+            // asked for explicitly 2026-09-20: "now it starts with article
+            // directly skipping the title"; overview asked for explicitly
+            // 2026-09-10) so playback opens the same way a sighted reader
+            // encounters the piece - title, then summary, then the full
+            // narrative - instead of jumping straight into the body with
+            // no framing. Neither was ever part of rawContent (sourceTitle
+            // is its own field, and loadDigest keeps rawOverview separate -
+            // see rawOverview's own doc), so without this neither reached
+            // the TTS stream at all.
             val renderedText = if (isDigest) {
-                val combined = if (rawOverview.isNotBlank()) "$rawOverview\n\n$rawContent" else rawContent
+                val withOverview = if (rawOverview.isNotBlank()) "$rawOverview\n\n$rawContent" else rawContent
+                val combined = if (sourceTitle.isNotBlank()) "$sourceTitle\n\n$withOverview" else withOverview
                 MarkdownRenderer.render(combined) { url ->
                     // A "#jump:" link scrolls/highlights the STATIC view
                     // (see staticContentSpannable's doc) - contentView is
@@ -697,6 +737,8 @@ class DetailActivity : Activity() {
                     // toast for what looks like a normal tap on a link.
                     if (!url.startsWith(JUMP_LINK_PREFIX)) openArticle(url)
                 }
+            } else if (sourceTitle.isNotBlank()) {
+                "$sourceTitle\n\n$rawContent"
             } else {
                 rawContent
             }

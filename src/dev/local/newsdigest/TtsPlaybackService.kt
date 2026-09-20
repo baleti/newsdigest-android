@@ -428,6 +428,7 @@ class TtsPlaybackService : Service() {
      * so far for this session. Clamps into range - can't seek into audio
      * that hasn't streamed in yet, or before the start. */
     fun seekTo(targetMs: Long) {
+        Log.d(TAG, "seekTo: requested targetMs=$targetMs currentPos=${getPositionMs()}")
         var newPosMs = 0L
         synchronized(lock) {
             if (allSentences.isEmpty()) return
@@ -443,6 +444,7 @@ class TtsPlaybackService : Service() {
             for (i in 0 until idx) newPosMs += allSentences[i].durationMs
             newPosMs += remaining
         }
+        Log.d(TAG, "seekTo: landed at newPosMs=$newPosMs")
         seekGeneration++ // an in-flight write loop sees this and abandons itself; playLoop re-reads playIndex/seekOffsetMs
         requestAudioFocus()
         audioTrack?.let { try { it.pause(); it.flush() } catch (_: Exception) {} }

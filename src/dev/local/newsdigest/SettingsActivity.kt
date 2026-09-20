@@ -6,11 +6,13 @@ import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 
 /**
@@ -119,7 +121,96 @@ class SettingsActivity : Activity() {
             setPadding(0, Theme.dp(this@SettingsActivity, 8), 0, 0)
         }
         root.addView(engineStatus)
-        checkEngineStatus(hostField, portField, engineStatus)
+
+        root.addView(spacer(24))
+        root.addView(sectionLabel("Voice"))
+        root.addView(spacer(6))
+        // Options repopulated per-engine below (Kokoro and Chatterbox have
+        // entirely different voice lists - see server.py's /voices) --
+        // "Default" always sits first and means "let the server pick"
+        // (Settings.getTtsVoice() == null).
+        val voiceAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("Default"))
+        val voiceSpinner = Spinner(this).apply { adapter = voiceAdapter }
+        root.addView(voiceSpinner)
+        var voiceOptions = listOf<String>()
+        var suppressVoiceCallback = false
+        voiceSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                if (suppressVoiceCallback) return
+                Settings.setTtsVoice(this@SettingsActivity, voiceOptions.getOrNull(position - 1))
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        fun refreshVoices(engine: String) {
+            Thread {
+                try {
+                    val host = hostField.text.toString().trim()
+                    val port = portField.text.toString().trim().toIntOrNull() ?: return@Thread
+                    if (host.isEmpty()) return@Thread
+                    val url = java.net.URL("http://$host:$port/voices?engine=$engine")
+                    val conn = url.openConnection() as java.net.HttpURLConnection
+                    conn.connectTimeout = 4000
+                    conn.readTimeout = 4000
+                    conn.setRequestProperty("X-Peer-Agent", "1")
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val arr = org.json.JSONObject(body).optJSONArray("voices") ?: org.json.JSONArray()
+                    val voices = (0 until arr.length()).map { arr.getString(it) }
+                    runOnUiThread {
+                        voiceOptions = voices
+                        voiceAdapter.clear()
+                        voiceAdapter.add("Default")
+                        voiceAdapter.addAll(voices)
+                        voiceAdapter.notifyDataSetChanged()
+                        suppressVoiceCallback = true
+                        val saved = Settings.getTtsVoice(this@SettingsActivity)
+                        voiceSpinner.setSelection((voices.indexOf(saved) + 1).coerceAtLeast(0))
+                        suppressVoiceCallback = false
+                    }
+                } catch (e: Exception) {
+                }
+            }.apply { isDaemon = true }.start()
+        }
+        refreshVoices(if (chatterboxRadio.isChecked) "chatterbox" else "kokoro")
+        engineGroup.setOnCheckedChangeListener { _, checkedId ->
+            val engine = if (checkedId == chatterboxRadio.id) "chatterbox" else "kokoro"
+            Settings.setTtsEngine(this, engine)
+            refreshVoices(engine)
+        }
+
+        root.addView(spacer(24))
+        root.addView(sectionLabel("Speech to text (testing)"))
+        root.addView(
+            TextView(this).apply {
+                text = "Which model transcribes your voice into the chat box. Three options here purely to compare them while this feature is new."
+                textSize = 12f
+                setTextColor(Theme.onSurfaceVariant)
+                setPadding(0, Theme.dp(this@SettingsActivity, 4), 0, Theme.dp(this@SettingsActivity, 6))
+            },
+        )
+        val sttGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        // Must match server.py's STT_ENGINES keys exactly.
+        val sttOptions = listOf(
+            "whisper-small-cpu" to "Small (CPU) - fastest, least accurate",
+            "whisper-medium-cpu" to "Medium (CPU) - balanced, default",
+            "whisper-large-v3-cpu" to "Large v3 (CPU) - most accurate, slower",
+        )
+        val sttRadios = sttOptions.mapIndexed { i, (key, label) ->
+            RadioButton(this).apply {
+                text = label
+                id = 100 + i
+                setTextColor(Theme.onBackground)
+                buttonTintList = ColorStateList.valueOf(Theme.primary)
+                tag = key
+            }
+        }
+        sttRadios.forEach { sttGroup.addView(it) }
+        root.addView(sttGroup)
+        val savedSttModel = Settings.getSttModel(this)
+        sttRadios.firstOrNull { it.tag == savedSttModel }?.isChecked = true
+        sttGroup.setOnCheckedChangeListener { _, checkedId ->
+            val picked = sttRadios.firstOrNull { it.id == checkedId }?.tag as? String ?: return@setOnCheckedChangeListener
+            Settings.setSttModel(this, picked)
+        }
 
         root.addView(spacer(24))
         root.addView(sectionLabel("Claude account for chat"))
@@ -135,6 +226,7 @@ class SettingsActivity : Activity() {
         root.addView(spacer(20))
 
         setContentView(ScrollView(this).apply { setBackgroundColor(Theme.bg); addView(root) })
+        checkEngineStatus(hostField, portField, engineStatus)
     }
 
     /** Chatterbox takes ~30s to load its CUDA model after the server
@@ -154,7 +246,10 @@ class SettingsActivity : Activity() {
                 conn.setRequestProperty("X-Peer-Agent", "1")
                 val body = conn.inputStream.bufferedReader().use { it.readText() }
                 val obj = org.json.JSONObject(body)
-                val text = "kokoro: ${obj.optString("kokoro", "?")} · chatterbox: ${obj.optString("chatterbox", "?")}"
+                val text = "kokoro: ${obj.optString("kokoro", "?")} · chatterbox: ${obj.optString("chatterbox", "?")}\n" +
+                    "whisper-small-cpu: ${obj.optString("whisper-small-cpu", "?")} · " +
+                    "whisper-medium-cpu: ${obj.optString("whisper-medium-cpu", "?")} · " +
+                    "whisper-large-v3-cpu: ${obj.optString("whisper-large-v3-cpu", "?")}"
                 runOnUiThread { statusView.text = text }
             } catch (e: Exception) {
                 runOnUiThread { statusView.text = "Server unreachable - check host/port" }

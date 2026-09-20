@@ -546,6 +546,7 @@ class ReadAloudController(
                     client.sendText(JSONObject().apply {
                         put("text", text)
                         put("engine", Settings.getTtsEngine(context))
+                        Settings.getTtsVoice(context)?.let { put("voice", it) }
                     }.toString())
                     mainHandler.post { reportPosition(client) }
                 }
@@ -624,6 +625,7 @@ class ReadAloudController(
      * ahead is for - see skipAheadTo()). */
     fun seekRelative(deltaMs: Long) {
         val svc = ttsService ?: return
+        Log.d("ReadAloudController", "seekRelative: deltaMs=$deltaMs")
         svc.seekTo((svc.getPositionMs() + deltaMs).coerceAtLeast(0))
     }
 

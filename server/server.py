@@ -1,8 +1,6 @@
 """
-TTS + feed server for the RSS reader app. Runs both TTS engines resident
-in one process (Kokoro on CPU via onnxruntime, Chatterbox on GPU via CUDA)
-so the app can pick either from a settings toggle. WireGuard-only: bound
-directly to the tunnel interface address (NEWSDIGEST_BIND_HOST), not
+Feed-digest + agent-chat server for the RSS reader app. WireGuard-only:
+bound directly to the tunnel interface address (NEWSDIGEST_BIND_HOST), not
 0.0.0.0 - unlike the phone's Companion app, a Linux host CAN bind to its
 own tunnel interface, so off-tunnel traffic never reaches this socket at
 the kernel level at all. The X-Peer-Agent header + Origin rejection below
@@ -10,41 +8,36 @@ is defense-in-depth beyond that: other peers sharing the same private
 network also run browsers, and a page loaded there could otherwise be
 tricked into hitting this port.
 
-Protocol (WebSocket, not plain HTTP streaming): plain HTTP has no clean way
-to interleave binary audio with per-sentence word-timing JSON in one
-response without inventing a framing format. A WebSocket already frames
-messages naturally, so each synthesized sentence arrives as a JSON message
-(text, word timings, sample rate) immediately followed by a binary message
-(that sentence's raw 16-bit PCM) - the app can start playing sentence 1
-while sentence 2 is still synthesizing, and highlight words using the
-timing metadata.
+TTS/STT (Kokoro, Chatterbox, faster-whisper) used to live in this same
+process - split out 2026-09-19 to ai1, a qemu VM on host1, so voice
+synthesis/dictation runs isolated from host3 and Chatterbox gets its own
+dedicated GPU instead of sharing host3's. See
+~/src/newsdigest-android/tts-stt-server/server.py (deployed to ai1) for
+that half.
 
-Word timings are a proportional-by-character-count estimate against the
-engine's real output duration, not a forced alignment - good enough for a
-reading-highlight UI without adding a whole alignment model on the
-responsiveness-critical path.
+The app still only ever talks to this one host/port, same as before the
+split - /tts/stream, /stt/*, /voices and /status below are a thin proxy
+onto ai1's server rather than the app being pointed at a second
+host/port. That's deliberate: host1 (and therefore ai1) is only reachable
+at all from this host's specific LAN address (see ai1-netup.sh's ufw rule
+on host1), not from the phone's WireGuard address - host3 is the one
+thing allowed to reach across to it, so it has to be the one place that
+does.
 """
 import asyncio
-import hashlib
 import ipaddress
 import json
 import os
-import re
 import sys
-import threading
-import time
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
 
-import numpy as np
+import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import FileResponse, JSONResponse
 
 import feed
-from acronyms import expand_acronyms, expand_domains
-from text_clean import markdown_to_speech
 
 # The article/digest chat feature doesn't run claude itself - it proxies to
 # the claude-agents daemon (~/.config/claude-agents/claude-agents-daemon.py,
@@ -75,21 +68,11 @@ def _env_or_fatal(name):
 BIND_HOST = _env_or_fatal("NEWSDIGEST_BIND_HOST")
 BIND_PORT = int(os.environ.get("NEWSDIGEST_BIND_PORT", "8792"))
 ALLOWED_SUBNET = ipaddress.ip_network(_env_or_fatal("NEWSDIGEST_ALLOWED_SUBNET"))
-MODEL_DIR = Path.home() / ".cache" / "newsdigest-server"
+# ai1's tts-stt-server, reachable only from this host (see module docstring).
+TTS_STT_UPSTREAM = os.environ.get("NEWSDIGEST_TTS_STT_UPSTREAM", "10.176.54.16:8100")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Kokoro loads in well under a second, so it's done inline and is
-    # already serving by the time this yields. Chatterbox's ~30s CUDA
-    # warmup runs in the background instead of blocking startup - /status
-    # reports it as "loading" until ready.
-    ENGINES["kokoro"].load()
-    threading.Thread(target=_load_engine_background, args=(ENGINES["chatterbox"],), daemon=True).start()
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 
 # ---------------------------------------------------------------- security
@@ -124,194 +107,142 @@ async def security_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# ------------------------------------------------------------------ text
-
-_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
-
-
-def split_sentences(text: str) -> list[str]:
-    text = re.sub(r"\n{2,}", "\n\n", text.strip())
-    parts = []
-    for para in text.split("\n\n"):
-        para = para.replace("\n", " ").strip()
-        if not para:
-            continue
-        parts.extend(s.strip() for s in _SENTENCE_RE.split(para) if s.strip())
-    return parts
-
-
-def estimate_word_timings(sentence: str, duration_s: float) -> list[dict]:
-    words = sentence.split()
-    if not words:
-        return []
-    char_counts = [max(len(w), 1) for w in words]
-    total_chars = sum(char_counts)
-    cursor = 0.0
-    timings = []
-    for word, count in zip(words, char_counts):
-        dur = duration_s * (count / total_chars)
-        timings.append({
-            "word": word,
-            "start_ms": round(cursor * 1000),
-            "end_ms": round((cursor + dur) * 1000),
-        })
-        cursor += dur
-    return timings
-
-
-def float_to_pcm16(samples: np.ndarray) -> bytes:
-    clipped = np.clip(samples, -1.0, 1.0)
-    return (clipped * 32767.0).astype(np.int16).tobytes()
-
-
-# ------------------------------------------------------------- tts cache
+# --------------------------------------------------------- tts/stt proxy
 #
-# Keyed by exactly what determines the audio (engine, voice, the expanded
-# text actually handed to the model) - a digest sent again tomorrow, an
-# article reopened after being read once already, or two articles sharing
-# boilerplate all hit this for free. Disk-backed (not just in-process) so a
-# server restart (systemd unit redeploy, host reboot) doesn't throw away
-# everything already paid for - Chatterbox in particular runs 5-15s/sentence,
-# not something worth re-paying on every restart. Stored as raw PCM16 (the
-# exact bytes already sent over the wire) plus a small JSON sidecar, rather
-# than the float samples - skips reconstructing anything on a cache hit,
-# just replays the same bytes/metadata synthesize_and_send would have sent.
+# Thin proxy onto ai1's tts-stt-server (see module docstring for why this
+# is a proxy rather than a second host/port the app points at directly).
+# HTTP routes proxy via run_in_threadpool + urllib (same pattern as
+# _agents_call below); the two WebSocket routes bridge messages in both
+# directions until either side closes.
 
-TTS_CACHE_DIR = MODEL_DIR / "tts-cache"
-TTS_CACHE_MAX_BYTES = 2 * 1024 ** 3  # 2 GiB, evicted LRU by mtime
+def _tts_stt_get(path: str, timeout: float = 15.0) -> tuple[int, bytes]:
+    import urllib.error
+    import urllib.request
 
-
-def _tts_cache_key(engine_name: str, voice: str | None, expanded_text: str) -> str:
-    raw = f"{engine_name}\x00{voice or ''}\x00{expanded_text}".encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _tts_cache_paths(key: str) -> tuple[Path, Path]:
-    return TTS_CACHE_DIR / f"{key}.pcm", TTS_CACHE_DIR / f"{key}.json"
-
-
-def _tts_cache_load(key: str) -> tuple[bytes, dict] | None:
-    pcm_path, meta_path = _tts_cache_paths(key)
+    req = urllib.request.Request(f"http://{TTS_STT_UPSTREAM}{path}", headers={"X-Peer-Agent": "1"})
     try:
-        meta = json.loads(meta_path.read_text())
-        pcm = pcm_path.read_bytes()
-    except (OSError, ValueError):
-        return None
-    now = time.time()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _tts_stt_post(path: str, body: bytes, timeout: float = 30.0) -> tuple[int, bytes]:
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"http://{TTS_STT_UPSTREAM}{path}", data=body, method="POST",
+        headers={"X-Peer-Agent": "1", "Content-Type": "application/octet-stream"},
+    )
     try:
-        os.utime(pcm_path, (now, now))
-        os.utime(meta_path, (now, now))
-    except OSError:
-        pass
-    return pcm, meta
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
 
-
-def _tts_cache_store(key: str, pcm: bytes, meta: dict) -> None:
-    try:
-        TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        pcm_path, meta_path = _tts_cache_paths(key)
-        pcm_path.write_bytes(pcm)
-        meta_path.write_text(json.dumps(meta))
-    except OSError:
-        return
-    _tts_cache_evict_if_needed()
-
-
-def _tts_cache_evict_if_needed() -> None:
-    try:
-        entries = sorted(TTS_CACHE_DIR.glob("*.pcm"), key=lambda p: p.stat().st_mtime)
-    except OSError:
-        return
-    total = sum(p.stat().st_size for p in entries)
-    for p in entries:
-        if total <= TTS_CACHE_MAX_BYTES:
-            break
-        try:
-            total -= p.stat().st_size
-            p.unlink(missing_ok=True)
-            p.with_suffix(".json").unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-# --------------------------------------------------------------- engines
-
-class KokoroEngine:
-    name = "kokoro"
-
-    def __init__(self):
-        self.ready = False
-        self._kokoro = None
-        self._lock = threading.Lock()
-
-    def load(self):
-        from kokoro_onnx import Kokoro
-        self._kokoro = Kokoro(
-            str(MODEL_DIR / "kokoro-v1.0.onnx"),
-            str(MODEL_DIR / "voices-v1.0.bin"),
-        )
-        self.ready = True
-
-    def voices(self) -> list[str]:
-        if not self._kokoro:
-            return []
-        return [v for v in self._kokoro.get_voices() if v.startswith(("af_", "am_", "bf_", "bm_"))]
-
-    def synthesize(self, text: str, voice: str | None) -> tuple[np.ndarray, int]:
-        with self._lock:
-            samples, sr = self._kokoro.create(text, voice=voice or "af_heart", speed=1.0, lang="en-us")
-        return samples, sr
-
-
-class ChatterboxEngine:
-    name = "chatterbox"
-
-    def __init__(self):
-        self.ready = False
-        self._model = None
-        self._lock = threading.Lock()
-
-    def load(self):
-        import torch  # noqa: F401 - import here, not at module scope, so a CUDA hiccup can't block Kokoro from serving
-        from chatterbox.tts import ChatterboxTTS
-        self._model = ChatterboxTTS.from_pretrained(device="cuda")
-        self.ready = True
-
-    def voices(self) -> list[str]:
-        return ["default"]
-
-    def synthesize(self, text: str, voice: str | None) -> tuple[np.ndarray, int]:
-        with self._lock:
-            wav = self._model.generate(text)
-        return wav.squeeze().numpy(), self._model.sr
-
-
-ENGINES = {
-    "kokoro": KokoroEngine(),
-    "chatterbox": ChatterboxEngine(),
-}
-
-
-def _load_engine_background(engine):
-    try:
-        engine.load()
-    except Exception as e:
-        print(f"[newsdigest-server] {engine.name} failed to load: {e.__class__.__name__}: {e}")
-
-
-# ------------------------------------------------------------------ HTTP
 
 @app.get("/status")
-def status():
-    return {name: ("ready" if e.ready else "loading") for name, e in ENGINES.items()}
+async def status():
+    code, body = await run_in_threadpool(_tts_stt_get, "/status")
+    return JSONResponse(json.loads(body), status_code=code)
 
 
 @app.get("/voices")
-def voices(engine: str = "kokoro"):
-    e = ENGINES.get(engine)
-    if e is None:
-        return JSONResponse({"error": "unknown engine"}, status_code=404)
-    return {"engine": engine, "voices": e.voices()}
+async def voices(engine: str = "kokoro"):
+    code, body = await run_in_threadpool(_tts_stt_get, f"/voices?engine={engine}")
+    return JSONResponse(json.loads(body), status_code=code)
+
+
+@app.get("/stt/models")
+async def stt_models():
+    code, body = await run_in_threadpool(_tts_stt_get, "/stt/models")
+    return JSONResponse(json.loads(body), status_code=code)
+
+
+@app.post("/stt/transcribe")
+async def stt_transcribe(request: Request, model: str = "whisper-medium-cpu"):
+    body = await request.body()
+    code, resp_body = await run_in_threadpool(_tts_stt_post, f"/stt/transcribe?model={model}", body)
+    return JSONResponse(json.loads(resp_body), status_code=code)
+
+
+async def _ws_proxy(client_ws: WebSocket, upstream_path: str):
+    client_host = client_ws.client.host if client_ws.client else None
+    if not _security_ok(client_host, client_ws.headers):
+        await client_ws.close(code=4403)
+        return
+    await client_ws.accept()
+
+    try:
+        # max_size defaults to 1 MiB in the websockets library - too small
+        # for a raw PCM16 audio frame from a long sentence (easily 1.5MB+
+        # at 24kHz mono), so ai1 forcibly closed the connection mid-stream
+        # with "1009 message too big" the moment one came through -
+        # reported live 2026-09-20 as "read aloud button in news digest
+        # stopped working" right after the TTS/STT split to ai1 introduced
+        # this proxy hop. 16MB is comfortably above any single sentence's
+        # audio while still bounded (not None/unlimited) against a
+        # runaway response.
+        upstream = await websockets.connect(
+            f"ws://{TTS_STT_UPSTREAM}{upstream_path}", additional_headers={"X-Peer-Agent": "1"},
+            max_size=16 * 1024 * 1024,
+        )
+    except Exception as e:
+        try:
+            await client_ws.send_json({"type": "error", "message": f"ai1 unreachable: {e}"})
+        except Exception:
+            pass
+        await client_ws.close()
+        return
+
+    async def from_client():
+        try:
+            while True:
+                msg = await client_ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                if (text := msg.get("text")) is not None:
+                    await upstream.send(text)
+                elif (data := msg.get("bytes")) is not None:
+                    await upstream.send(data)
+        except WebSocketDisconnect:
+            pass
+
+    async def from_upstream():
+        async for message in upstream:
+            if isinstance(message, bytes):
+                await client_ws.send_bytes(message)
+            else:
+                await client_ws.send_text(message)
+
+    tasks = [asyncio.create_task(from_client()), asyncio.create_task(from_upstream())]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            if t.cancelled():
+                continue
+            exc = t.exception()
+            if exc is not None:
+                print(f"[newsdigest-server] tts/stt proxy task error: {exc.__class__.__name__}: {exc}")
+    finally:
+        for t in tasks:
+            t.cancel()
+        await upstream.close()
+        try:
+            await client_ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/tts/stream")
+async def tts_stream(websocket: WebSocket):
+    await _ws_proxy(websocket, "/tts/stream")
+
+
+@app.websocket("/stt/stream")
+async def stt_stream(websocket: WebSocket):
+    await _ws_proxy(websocket, "/stt/stream")
 
 
 # ------------------------------------------------------------------ feed
@@ -357,156 +288,6 @@ def feed_digests_history(limit: int = 30):
     dated run still on disk (build_digest_json.py's own retention curve
     decides how far back that goes), not just the latest one."""
     return {"runs": feed.list_digest_runs(limit=min(limit, 100))}
-
-
-# ------------------------------------------------------------------- WS
-#
-# Lookahead cap: the synthesis loop below won't get more than this far
-# ahead of wherever the client says it actually is in playback. Without it,
-# the loop just races through synthesize_and_send() for the entire
-# article/message the moment the stream opens, regardless of whether
-# playback is paused or even still on the first sentence - reported live
-# 2026-09-09 ("doing the whole article after first play", specifically
-# after pressing pause). The client reports progress via periodic
-# {"type": "position", "played_ms": ...} messages (see ReadAloudController's
-# streamText()/streamCurrentSection()); a paused client simply stops
-# advancing that number, so the cap enforces itself with no separate
-# "paused" flag needed.
-TTS_LOOKAHEAD_CAP_MS = 30_000
-
-@app.websocket("/tts/stream")
-async def tts_stream(websocket: WebSocket):
-    client_host = websocket.client.host if websocket.client else None
-    if not _security_ok(client_host, websocket.headers):
-        await websocket.close(code=4403)
-        return
-
-    await websocket.accept()
-    try:
-        req = await websocket.receive_json()
-        text = (req.get("text") or "").strip()
-        engine_name = req.get("engine", "kokoro")
-        voice = req.get("voice")
-
-        engine = ENGINES.get(engine_name)
-        if not text:
-            await websocket.send_json({"type": "error", "message": "empty text"})
-            return
-        if engine is None:
-            await websocket.send_json({"type": "error", "message": f"unknown engine '{engine_name}'"})
-            return
-        if not engine.ready:
-            await websocket.send_json({"type": "error", "message": f"'{engine_name}' is still loading"})
-            return
-
-        cleaned = markdown_to_speech(text)
-        # Sentences are split from the pre-acronym-expansion text, and that
-        # is what gets returned in "text"/"words" too - expansion ("RCE" ->
-        # "R C E") only happens right before synthesis, inside
-        # synthesize_and_send(). Otherwise a client highlighting words
-        # against its own normally-rendered display would see "R", "C", "E"
-        # as three separate timed words instead of the one word "RCE" it
-        # actually shows on screen - confirmed this mismatch live before
-        # splitting sentences off the expanded text was fixed here.
-        sentences = split_sentences(cleaned)
-
-        # played_ms stays None until the client's first "position" message
-        # arrives, so a client that never sends one (an older build) gets
-        # no throttling at all rather than stalling forever after the first
-        # TTS_LOOKAHEAD_CAP_MS of audio. disconnected doubles as both "stop
-        # waiting, the socket is gone" and the wait's own sleep timer.
-        played_ms = {"value": None}
-        disconnected = asyncio.Event()
-
-        async def receive_position_updates():
-            try:
-                while True:
-                    msg = await websocket.receive_json()
-                    if msg.get("type") == "position":
-                        v = msg.get("played_ms")
-                        if isinstance(v, (int, float)) and v >= 0:
-                            played_ms["value"] = v
-            except WebSocketDisconnect:
-                pass
-            finally:
-                disconnected.set()
-
-        position_task = asyncio.create_task(receive_position_updates())
-        try:
-            sent_ms = 0
-            for sentence in sentences:
-                while (
-                    played_ms["value"] is not None
-                    and sent_ms - played_ms["value"] > TTS_LOOKAHEAD_CAP_MS
-                ):
-                    if disconnected.is_set():
-                        return
-                    try:
-                        await asyncio.wait_for(disconnected.wait(), timeout=0.25)
-                    except asyncio.TimeoutError:
-                        pass
-                sent_ms += await synthesize_and_send(websocket, engine, engine_name, sentence, voice)
-
-            await websocket.send_json({"type": "done"})
-        finally:
-            position_task.cancel()
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        try:
-            await websocket.send_json({"type": "error", "message": f"{e.__class__.__name__}: {e}"})
-        except Exception:
-            pass
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
-
-async def synthesize_and_send(
-    websocket: WebSocket, engine, engine_name: str, sentence: str, voice: str | None,
-) -> int:
-    """sentence is exactly what the client will display and highlight -
-    acronym/domain expansion happens only in the copy handed to the engine,
-    never reaching the client, so word timings always line up with what's
-    shown on screen (see the comment above tts_stream's sentence loop).
-    Returns the sentence's duration in ms, so the caller can track how far
-    ahead of reported playback position it's gotten (see
-    TTS_LOOKAHEAD_CAP_MS)."""
-    expanded = expand_domains(expand_acronyms(sentence))
-    cache_key = _tts_cache_key(engine_name, voice, expanded)
-    cached = await run_in_threadpool(_tts_cache_load, cache_key)
-    if cached is not None:
-        pcm, meta = cached
-        duration_ms = meta["duration_ms"]
-        await websocket.send_json({
-            "type": "sentence",
-            "text": sentence,
-            "sample_rate": meta["sample_rate"],
-            "duration_ms": duration_ms,
-            "synth_ms": 0,
-            "words": estimate_word_timings(sentence, duration_ms / 1000),
-        })
-        await websocket.send_bytes(pcm)
-        return duration_ms
-
-    t0 = time.monotonic()
-    samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
-    duration_s = len(samples) / sr
-    duration_ms = round(duration_s * 1000)
-    pcm = float_to_pcm16(samples)
-    await run_in_threadpool(_tts_cache_store, cache_key, pcm, {"sample_rate": sr, "duration_ms": duration_ms})
-    await websocket.send_json({
-        "type": "sentence",
-        "text": sentence,
-        "sample_rate": sr,
-        "duration_ms": duration_ms,
-        "synth_ms": round((time.monotonic() - t0) * 1000),
-        "words": estimate_word_timings(sentence, duration_s),
-    })
-    await websocket.send_bytes(pcm)
-    return duration_ms
 
 
 # ------------------------------------------------------------------ agent
@@ -631,7 +412,23 @@ async def agent_stream(session_id: str, since: int = 0, timeout: float = 25.0):
     return resp
 
 
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
+    # loop="asyncio", not uvicorn's uvloop default: the /tts/stream and
+    # /stt/stream proxy routes open their own outbound client connection
+    # (websockets.connect) from inside a request handler - under uvloop
+    # this reproduced as either an immediate ECONNREFUSED or a silent hang
+    # on that outbound connect (confirmed live 2026-09-19: identical code
+    # worked instantly as a bare `python3 -c` script using the default
+    # asyncio loop, failed inconsistently only when run inside uvicorn's
+    # uvloop-based server). Not a hot enough path to need uvloop's speed.
+    #
+    # ws_max_size: the 16MB override on the ai1-facing websockets.connect()
+    # call (see _ws_proxy above) only covers that outbound leg. This is the
+    # OTHER leg - uvicorn's own ASGI websocket server handling the phone's
+    # inbound connection - which still used its 1MiB default and hit the
+    # same "1009 message too big" failure from the other side (confirmed
+    # live 2026-09-20 via newsdigest-server's own log: "sent 1009 ... frame
+    # with 1194213 bytes exceeds limit of 1048576 bytes"). Match the same
+    # 16MB bound here for consistency.
+    uvicorn.run(app, host=BIND_HOST, port=BIND_PORT, loop="asyncio", ws_max_size=16 * 1024 * 1024)
