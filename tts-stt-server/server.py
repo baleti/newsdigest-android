@@ -152,9 +152,24 @@ TTS_CACHE_DIR = MODEL_DIR / "tts-cache"
 TTS_CACHE_MAX_BYTES = 2 * 1024 ** 3  # 2 GiB, evicted LRU by mtime
 
 
-def _tts_cache_key(engine_name: str, voice: str | None, expanded_text: str) -> str:
-    raw = f"{engine_name}\x00{voice or ''}\x00{expanded_text}".encode("utf-8")
+def _tts_cache_key(engine_name: str, voice: str | None, expanded_text: str, extra: str = "") -> str:
+    raw = f"{engine_name}\x00{voice or ''}\x00{extra}\x00{expanded_text}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _chatterbox_cache_extra() -> str:
+    """Folded into chatterbox's cache key so a sentence cached under
+    yesterday's voice-of-the-day never gets served back today under the
+    wrong voice - without this, daily rotation would be invisible for any
+    sentence that happened to already be cached (a real bug caught live
+    2026-09-23 testing this feature: a just-added rotation produced
+    synth_ms=0 cache hits instead of exercising the new voice at all).
+    Old entries just age out via the existing cache size eviction -
+    nothing needs to actively purge them."""
+    voices = _chatterbox_voice_library()
+    if not voices:
+        return ""
+    return voices[_todays_chatterbox_voice_index(len(voices))].stem
 
 
 def _tts_cache_paths(key: str) -> tuple[Path, Path]:
@@ -234,6 +249,33 @@ class KokoroEngine:
         return samples, sr
 
 
+# Chatterbox voices a different day each other than a small fixed preset
+# list (which it doesn't have) - it does zero-shot voice cloning from a
+# reference clip (ChatterboxTTS.generate's `audio_prompt_path`, or the
+# separate `prepare_conditionals(wav_path)` to set it once and reuse for
+# many generate() calls rather than re-encoding the reference every
+# sentence). Asked for explicitly 2026-09-22 ("does chatterbox offer
+# different voices? could we have a different voice set at every day...
+# dozens, different one every day") - the reference clips themselves are
+# kokoro's own 28 built-in voices (already licensed/bundled, zero rights
+# question, zero real-person impersonation risk), synthesized once into
+# this directory and cloned by Chatterbox from there. 28 voices -> the
+# rotation repeats every 28 days, comfortably "dozens... different one
+# every day".
+CHATTERBOX_VOICE_LIBRARY_DIR = Path.home() / ".cache" / "ai1-tts-stt-server" / "chatterbox-voices"
+
+
+def _chatterbox_voice_library() -> list[Path]:
+    if not CHATTERBOX_VOICE_LIBRARY_DIR.is_dir():
+        return []
+    return sorted(CHATTERBOX_VOICE_LIBRARY_DIR.glob("*.wav"))
+
+
+def _todays_chatterbox_voice_index(count: int) -> int:
+    import datetime
+    return datetime.date.today().toordinal() % count
+
+
 class ChatterboxEngine:
     def __init__(self, device: str = "cuda"):
         self.name = "chatterbox"
@@ -241,12 +283,20 @@ class ChatterboxEngine:
         self.ready = False
         self._model = None
         self._lock = threading.Lock()
+        # Which library index is currently prepare_conditionals()-ed onto
+        # the model, if any - re-checked (cheap) on every synthesize() call
+        # so a day rollover takes effect without needing to reload the
+        # whole model, but the (not-quite-as-cheap) actual re-prep only
+        # happens on the rare call where the day has genuinely changed.
+        self._prepared_voice_index: int | None = None
 
     def load(self):
         import torch  # noqa: F401 - import here, not at module scope, so a CUDA hiccup can't block Kokoro from serving
         from chatterbox.tts import ChatterboxTTS
         self._model = ChatterboxTTS.from_pretrained(device=self.device)
+        self._prepared_voice_index = None
         self.ready = True
+        self._apply_todays_voice_locked()
 
     def unload(self):
         with self._lock:
@@ -257,11 +307,29 @@ class ChatterboxEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _apply_todays_voice_locked(self) -> None:
+        """Caller must hold self._lock. No-op if today's voice is already
+        the one prepared (the common case - only actually re-runs
+        prepare_conditionals when the day has rolled over since the last
+        call, or on first load)."""
+        voices = _chatterbox_voice_library()
+        if not voices:
+            return
+        idx = _todays_chatterbox_voice_index(len(voices))
+        if idx == self._prepared_voice_index:
+            return
+        try:
+            self._model.prepare_conditionals(str(voices[idx]), exaggeration=0.5)
+            self._prepared_voice_index = idx
+        except Exception as e:
+            print(f"[ai1-tts-stt-server] chatterbox voice prep failed for {voices[idx]}: {e}", flush=True)
+
     def voices(self) -> list[str]:
         return ["default"]
 
     def synthesize(self, text: str, voice: str | None) -> tuple[np.ndarray, int]:
         with self._lock:
+            self._apply_todays_voice_locked()
             wav = self._model.generate(text)
         return wav.squeeze().numpy(), self._model.sr
 
@@ -551,6 +619,9 @@ def status():
             out["gpu1_resident"] = json.loads(resp.read()).get("gpu1", {}).get("resident")
     except Exception:
         out["gpu1_resident"] = "unknown (arbiter unreachable)"
+    voices = _chatterbox_voice_library()
+    if voices:
+        out["chatterbox_voice_today"] = voices[_todays_chatterbox_voice_index(len(voices))].stem
     return out
 
 
@@ -853,7 +924,8 @@ async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: s
     (TTS_MAX_CONCURRENT_SYNTHESIS), now actually reachable by a single
     stream instead of only by two unrelated ones overlapping by chance."""
     expanded = expand_domains(expand_acronyms(sentence))
-    cache_key = _tts_cache_key(engine_name, voice, expanded)
+    extra = _chatterbox_cache_extra() if engine_name == "chatterbox" else ""
+    cache_key = _tts_cache_key(engine_name, voice, expanded, extra)
     cached = await run_in_threadpool(_tts_cache_load, cache_key)
     if cached is not None:
         pcm, meta = cached
