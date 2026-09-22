@@ -674,12 +674,27 @@ def voices(engine: str = "kokoro"):
 
 # ------------------------------------------------------------------- WS
 #
-# See newsdigest-server.py's original comments (host3) above TTS_LOOKAHEAD_CAP_MS
-# and TTS_MAX_CONCURRENT_SYNTHESIS for the incidents that produced these
-# values - unchanged here.
-TTS_LOOKAHEAD_CAP_MS = 18_000
+# See newsdigest-server.py's original comments (host3) above
+# TTS_MAX_CONCURRENT_SYNTHESIS for the incident that produced that value -
+# unchanged. TTS_LOOKAHEAD_CAP_MS bumped 18s -> 30s and decoupled from
+# TTS_MAX_CONCURRENT_SYNTHESIS on 2026-09-22 (see fill_pipeline's own doc) -
+# the two were never the same thing: this is how far ahead of PLAYBACK the
+# pipeline is allowed to buffer, that's how many sentences may synthesize
+# on the GPU(s) at once. Conflating them meant the buffer could never get
+# more than 2 sentences deep regardless of this constant.
+TTS_LOOKAHEAD_CAP_MS = 30_000
 TTS_MAX_CONCURRENT_SYNTHESIS = 2
 _tts_synthesis_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT_SYNTHESIS)
+
+
+def _estimate_sentence_ms(sentence: str) -> float:
+    """Rough pre-synthesis duration guess (same ~160wpm pacing assumption
+    the Android clients use for their own upfront estimates) - used only to
+    gate how far ahead fill_pipeline() is willing to keep starting sentences
+    before any of them have a real duration_ms yet. Replaced by the real
+    value the moment each sentence's own synthesis actually completes."""
+    words = len(sentence.split())
+    return max(500.0, words / (160.0 / 60.0) * 1000)
 
 
 @app.websocket("/tts/stream")
@@ -729,23 +744,87 @@ async def tts_stream(websocket: WebSocket):
         position_task = asyncio.create_task(receive_position_updates())
         try:
             sent_ms = 0
-            for sentence in sentences:
-                while (
-                    played_ms["value"] is not None
-                    and sent_ms - played_ms["value"] > TTS_LOOKAHEAD_CAP_MS
-                ):
-                    if disconnected.is_set():
-                        return
+            n = len(sentences)
+            # Pipelined, not sequential: up to TTS_MAX_CONCURRENT_SYNTHESIS
+            # sentences synthesize at once (this is what actually exercises
+            # both Chatterbox instances - ChatterboxPool.synthesize()'s own
+            # free-queue is what splits concurrent calls across GPU 0 and
+            # GPU 1). Results are still SENT in order - synthesis can finish
+            # out of order, playback can't. Before this, the loop awaited
+            # each sentence fully before starting the next, so a second
+            # GPU/Chatterbox instance sat idle for a single continuous read
+            # no matter how many were available (reported live 2026-09-22:
+            # "read aloud is really slow... given that we now have
+            # Chatterbox running on both GPUs" - the instances existed,
+            # nothing here was ever issuing overlapping requests to use them).
+            pending: dict[int, asyncio.Task] = {}
+            next_to_start = 0
+            next_to_send = 0
+            # Rough duration of sentences currently pending (started, not
+            # yet sent - so not yet reflected in sent_ms). Lets the
+            # lookahead check see "sent + being-synthesized" instead of
+            # just "sent", which is what actually lets it keep filling the
+            # pipeline many sentences deep instead of stalling after 1.
+            pending_estimate_ms = 0.0
+
+            def lookahead_ok() -> bool:
+                if played_ms["value"] is None:
+                    return True
+                return (sent_ms + pending_estimate_ms) - played_ms["value"] <= TTS_LOOKAHEAD_CAP_MS
+
+            def fill_pipeline() -> None:
+                # No concurrency cap here on purpose - only how far AHEAD
+                # (in estimated ms) we're willing to buffer. Actual GPU
+                # concurrency is capped elsewhere (_tts_synthesis_semaphore,
+                # and ChatterboxPool's own 2-instance free-queue): a task
+                # started here beyond what the hardware can run right now
+                # just blocks inside run_in_threadpool() waiting for a free
+                # instance, same as it always would - starting it early
+                # costs nothing but a queued asyncio task, and means the
+                # instant a GPU frees up it picks up the NEXT sentence
+                # immediately instead of waiting for this stream to notice
+                # and ask for it. Before this had `len(pending) <
+                # TTS_MAX_CONCURRENT_SYNTHESIS` here too, which meant the
+                # pipeline could never hold more than 2 sentences no matter
+                # how large TTS_LOOKAHEAD_CAP_MS was - confirmed live
+                # 2026-09-22: sentences 1+2 synthesized in parallel as
+                # intended, then nothing started sentence 3 until sentence
+                # 1 was fully SENT (not just synthesized), producing a long
+                # audible stall right when the buffer should have already
+                # been several sentences deep.
+                nonlocal next_to_start, pending_estimate_ms
+                while next_to_start < n and lookahead_ok():
+                    idx = next_to_start
+                    next_to_start += 1
+                    pending_estimate_ms += _estimate_sentence_ms(sentences[idx])
+                    pending[idx] = asyncio.create_task(
+                        _synthesize_sentence(engine, engine_name, sentences[idx], voice)
+                    )
+
+            fill_pipeline()
+            while next_to_send < n:
+                if disconnected.is_set():
+                    return
+                task = pending.get(next_to_send)
+                if task is None:
+                    # Nothing pending for the next sentence yet - either the
+                    # lookahead cap is holding it back (client is far behind),
+                    # or (shouldn't happen) it just hasn't been scheduled.
+                    # Wait a beat and recheck rather than busy-loop.
                     try:
                         await asyncio.wait_for(disconnected.wait(), timeout=0.25)
                     except asyncio.TimeoutError:
                         pass
+                    fill_pipeline()
+                    continue
+                pcm, meta = await task
+                del pending[next_to_send]
+                pending_estimate_ms = max(0.0, pending_estimate_ms - _estimate_sentence_ms(sentences[next_to_send]))
                 if disconnected.is_set():
                     return
-                async with _tts_synthesis_semaphore:
-                    if disconnected.is_set():
-                        return
-                    sent_ms += await synthesize_and_send(websocket, engine, engine_name, sentence, voice)
+                sent_ms += await _send_sentence(websocket, pcm, meta)
+                next_to_send += 1
+                fill_pipeline()
 
             await websocket.send_json({"type": "done"})
         finally:
@@ -766,39 +845,45 @@ async def tts_stream(websocket: WebSocket):
             pass
 
 
-async def synthesize_and_send(
-    websocket: WebSocket, engine, engine_name: str, sentence: str, voice: str | None,
-) -> int:
+async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: str | None) -> tuple[bytes, dict]:
+    """Just the synthesis half - no websocket I/O - so tts_stream can run
+    several of these as concurrent tasks and send the results in order
+    once ready. A cache hit intentionally skips the semaphore below (it's
+    not real GPU work); a real synthesis holds it, same limit as before
+    (TTS_MAX_CONCURRENT_SYNTHESIS), now actually reachable by a single
+    stream instead of only by two unrelated ones overlapping by chance."""
     expanded = expand_domains(expand_acronyms(sentence))
     cache_key = _tts_cache_key(engine_name, voice, expanded)
     cached = await run_in_threadpool(_tts_cache_load, cache_key)
     if cached is not None:
         pcm, meta = cached
-        duration_ms = meta["duration_ms"]
-        await websocket.send_json({
-            "type": "sentence",
-            "text": sentence,
-            "sample_rate": meta["sample_rate"],
-            "duration_ms": duration_ms,
-            "synth_ms": 0,
-            "words": estimate_word_timings(sentence, duration_ms / 1000),
-        })
-        await websocket.send_bytes(pcm)
-        return duration_ms
+        return pcm, {
+            "text": sentence, "sample_rate": meta["sample_rate"],
+            "duration_ms": meta["duration_ms"], "synth_ms": 0,
+        }
 
-    t0 = time.monotonic()
-    samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
-    duration_s = len(samples) / sr
-    duration_ms = round(duration_s * 1000)
-    pcm = float_to_pcm16(samples)
-    await run_in_threadpool(_tts_cache_store, cache_key, pcm, {"sample_rate": sr, "duration_ms": duration_ms})
+    async with _tts_synthesis_semaphore:
+        t0 = time.monotonic()
+        samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
+        duration_s = len(samples) / sr
+        duration_ms = round(duration_s * 1000)
+        pcm = float_to_pcm16(samples)
+        await run_in_threadpool(_tts_cache_store, cache_key, pcm, {"sample_rate": sr, "duration_ms": duration_ms})
+        return pcm, {
+            "text": sentence, "sample_rate": sr,
+            "duration_ms": duration_ms, "synth_ms": round((time.monotonic() - t0) * 1000),
+        }
+
+
+async def _send_sentence(websocket: WebSocket, pcm: bytes, meta: dict) -> int:
+    duration_ms = meta["duration_ms"]
     await websocket.send_json({
         "type": "sentence",
-        "text": sentence,
-        "sample_rate": sr,
+        "text": meta["text"],
+        "sample_rate": meta["sample_rate"],
         "duration_ms": duration_ms,
-        "synth_ms": round((time.monotonic() - t0) * 1000),
-        "words": estimate_word_timings(sentence, duration_s),
+        "synth_ms": meta["synth_ms"],
+        "words": estimate_word_timings(meta["text"], duration_ms / 1000),
     })
     await websocket.send_bytes(pcm)
     return duration_ms
