@@ -24,11 +24,12 @@ import hashlib
 import ipaddress
 import json
 import os
+import queue
 import re
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +61,9 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=_load_engine_background, args=(ENGINES["chatterbox"],), daemon=True).start()
     for stt_engine in STT_ENGINES.values():
         threading.Thread(target=_load_engine_background, args=(stt_engine,), daemon=True).start()
+    # No separate registration step here - RemoteGpuModel.use() registers
+    # on every call (see its own comment for why), so whichever GPU1
+    # participant's background load thread runs first just works.
     yield
 
 
@@ -231,9 +235,9 @@ class KokoroEngine:
 
 
 class ChatterboxEngine:
-    name = "chatterbox"
-
-    def __init__(self):
+    def __init__(self, device: str = "cuda"):
+        self.name = "chatterbox"
+        self.device = device
         self.ready = False
         self._model = None
         self._lock = threading.Lock()
@@ -241,8 +245,17 @@ class ChatterboxEngine:
     def load(self):
         import torch  # noqa: F401 - import here, not at module scope, so a CUDA hiccup can't block Kokoro from serving
         from chatterbox.tts import ChatterboxTTS
-        self._model = ChatterboxTTS.from_pretrained(device="cuda")
+        self._model = ChatterboxTTS.from_pretrained(device=self.device)
         self.ready = True
+
+    def unload(self):
+        with self._lock:
+            self._model = None
+            self.ready = False
+        import gc
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def voices(self) -> list[str]:
         return ["default"]
@@ -253,9 +266,136 @@ class ChatterboxEngine:
         return wav.squeeze().numpy(), self._model.sr
 
 
+# ------------------------------------------------------------- GPU arbiter
+#
+# GPU 1 (6GB) can't permanently hold everything that wants it: whisper-medium-gpu
+# (~0.9GB) and a second Chatterbox instance (~3.5GB) fit together fine (confirmed
+# live 2026-09-22 - 1.6GB to spare), but ai1's separate image-gen process
+# (chat_server.py's sd-server, a DIFFERENT OS process from this one) also wants
+# this same card and needs most of its 6GB when active. A plain in-process lock
+# can't coordinate across processes, so residency is arbitrated by
+# gpu-model-manager.py - a tiny standalone stdlib HTTP service on this same VM
+# (127.0.0.1:8101) that any GPU-hungry service registers a model with. See that
+# file's docstring for the full protocol and, importantly, the deadlock/
+# evict-mid-use correctness notes - this class follows that contract exactly:
+# `use()` does NOT hold `lock` across the network round-trip to `/acquire`
+# (only after it returns), and each RemoteGpuModel gets its OWN lock rather
+# than a lock shared across everything this process registers, so evicting
+# model A here is never blocked behind model B's in-flight use.
+#
+# 2026-09-22 incident: an earlier, purely in-process version of this file's
+# GPU-1 swapping held one shared lock and evicted synchronously mid-request,
+# and something in that window corrupted whisper-medium-gpu's CUDA context -
+# real dictation came back as garbage until the process was restarted. This
+# design (separate per-model locks, arbiter never called while holding one)
+# is the fix; don't collapse it back into a single shared lock.
+GPU_MANAGER_URL = os.environ.get("GPU_MANAGER_URL", "http://127.0.0.1:8101")
+
+
+def _gpu_manager_post(path: str, body: dict, timeout: float = 60.0) -> dict:
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        f"{GPU_MANAGER_URL}{path}", data=json.dumps(body).encode(),
+        method="POST", headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+class RemoteGpuModel:
+    """This process's membership in one shared GPU slot. `own_evict_url` must
+    already be routed to call `evict()` before `register()` runs - see the
+    `/internal/gpu/evict/{model}` route below."""
+
+    def __init__(self, slot: str, model: str, own_evict_url: str, unload_fn):
+        self.slot = slot
+        self.model = model
+        self.own_evict_url = own_evict_url
+        self.unload_fn = unload_fn
+        self.lock = threading.Lock()
+
+    def register(self) -> None:
+        _gpu_manager_post("/register", {"slot": self.slot, "model": self.model, "evict_url": self.own_evict_url})
+
+    @contextmanager
+    def use(self):
+        with self.lock:
+            # Registering on every use (not just once at startup) is
+            # deliberate, not laziness: it's what closes a real startup
+            # race - lifespan() used to kick off registration and the
+            # eager whisper-medium-gpu load in separate, unordered
+            # background threads, and the load's first `/acquire` call
+            # would 404 if it won the race against `/register` (confirmed
+            # live 2026-09-22 in the offline integration test this class
+            # was validated with). Registration is a cheap dict update on
+            # the arbiter side (no eviction happens on register), so
+            # paying for it on every use is a non-issue.
+            self.register()
+            _gpu_manager_post("/acquire", {"slot": self.slot, "model": self.model})
+            yield
+
+    def evict(self) -> None:
+        with self.lock:
+            self.unload_fn()
+
+
+GPU1_PARTICIPANTS: dict[str, RemoteGpuModel] = {}  # populated below and after WhisperEngine
+
+
+class ChatterboxPool:
+    """Chatterbox synthesis across two instances: `primary` is permanently
+    resident on GPU 0, `secondary` lives on GPU 1 behind `slot` and only
+    loads (or reloads, if it was evicted since) when actually needed.
+    `synthesize()` hands out whichever instance is free - with both
+    available, two sentences can generate at once instead of queuing behind
+    one GPU (see tts_stream's pipelined lookahead).
+    """
+
+    name = "chatterbox"
+
+    def __init__(self, primary: ChatterboxEngine, slot: RemoteGpuModel, secondary: ChatterboxEngine):
+        self._primary = primary
+        self._slot = slot
+        self._secondary = secondary
+        self._free: queue.Queue = queue.Queue()
+
+    @property
+    def ready(self) -> bool:
+        return self._primary.ready
+
+    def load(self):
+        self._primary.load()
+        self._free.put("primary")
+        self._free.put("secondary")
+
+    def voices(self) -> list[str]:
+        return ["default"]
+
+    def synthesize(self, text: str, voice: str | None) -> tuple[np.ndarray, int]:
+        slot_id = self._free.get()
+        try:
+            if slot_id == "primary":
+                return self._primary.synthesize(text, voice)
+            with self._slot.use():
+                if not self._secondary.ready:
+                    self._secondary.load()
+                return self._secondary.synthesize(text, voice)
+        finally:
+            self._free.put(slot_id)
+
+
+_chatterbox_secondary = ChatterboxEngine(device="cuda:1")
+_chatterbox_b_slot = RemoteGpuModel(
+    "gpu1", "chatterbox-b",
+    f"http://127.0.0.1:{BIND_PORT}/internal/gpu/evict/chatterbox-b",
+    _chatterbox_secondary.unload,
+)
+GPU1_PARTICIPANTS["chatterbox-b"] = _chatterbox_b_slot
+
 ENGINES = {
     "kokoro": KokoroEngine(),
-    "chatterbox": ChatterboxEngine(),
+    "chatterbox": ChatterboxPool(ChatterboxEngine(device="cuda:0"), _chatterbox_b_slot, _chatterbox_secondary),
 }
 
 
@@ -282,12 +422,14 @@ STT_MAX_BYTES = 16_000 * 2 * 120  # 16kHz, 16-bit mono, 2 minutes - generous for
 class WhisperEngine:
     # device_index matters here specifically because this VM has TWO
     # GPUs (confirmed live 2026-09-20 while chasing "is there anything
-    # we can do to speed up the transcription") - GPU 0 already has
-    # Chatterbox loaded on it, GPU 1 sits idle. Defaults to 0 so a
-    # device="cpu" engine (device_index is simply unused then) and any
-    # future device="cuda" caller that doesn't care both keep working
-    # unchanged; the GPU engine below passes 1 explicitly to land on
-    # the otherwise-idle card instead of contending with Chatterbox.
+    # we can do to speed up the transcription") - GPU 0 holds the primary
+    # Chatterbox instance. Defaults to 0 so a device="cpu" engine
+    # (device_index is simply unused then) and any future device="cuda"
+    # caller that doesn't care both keep working unchanged; the GPU
+    # engine below passes 1 explicitly. GPU 1 is no longer exclusively
+    # this engine's - see the GPU arbiter section above - so this model
+    # can be unloaded and reloaded on demand, not just loaded once at
+    # startup.
     def __init__(self, name: str, model_size: str, device: str, compute_type: str, device_index: int = 0):
         self.name = name
         self.model_size = model_size
@@ -304,6 +446,19 @@ class WhisperEngine:
         self._model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type, **kwargs)
         self.ready = True
 
+    def unload(self):
+        with self._lock:
+            self._model = None
+            self.ready = False
+        if self.device == "cuda":
+            import gc
+            gc.collect()
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     def transcribe(self, samples: np.ndarray) -> str:
         with self._lock:
             segments, _info = self._model.transcribe(samples, language="en", beam_size=1)
@@ -316,17 +471,44 @@ class WhisperEngine:
                 on_segment(seg)
 
 
-# The original three-size A/B set (see host3's git history) was trimmed
-# to just medium on 2026-09-19 - loading all three plus Kokoro plus
-# Chatterbox didn't fit in this VM's RAM at the time (confirmed live,
-# the service OOM-looped 97 times before settling on trimming this).
-# small was added back 2026-09-20 ("is there anything we can do to
-# speed up the transcription" - CPU whisper-medium has a real, roughly
-# duration-independent floor per call, small is meaningfully faster at
-# some accuracy cost) - the VM has since grown enough headroom (16GB,
-# ~9GB free with both sizes plus Kokoro plus Chatterbox loaded) that
-# this pairing is fine; medium is kept as the other apps' own default,
-# re-add large here too if ever actually needed for comparison.
+class SlotWhisperProxy:
+    """A WhisperEngine that lives behind a RemoteGpuModel instead of being
+    permanently resident - same interface (name/ready/transcribe/
+    transcribe_streaming), so the rest of the file doesn't need to know
+    whether whisper-medium-gpu is actually loaded at any given moment."""
+
+    def __init__(self, slot: RemoteGpuModel, inner: WhisperEngine):
+        self.name = inner.name
+        self._slot = slot
+        self._inner = inner
+        self.ready = False
+
+    def load(self):
+        with self._slot.use():
+            self._inner.load()
+        self.ready = True
+
+    def transcribe(self, samples: np.ndarray) -> str:
+        with self._slot.use():
+            if not self._inner.ready:
+                self._inner.load()
+            return self._inner.transcribe(samples)
+
+    def transcribe_streaming(self, samples: np.ndarray, on_segment) -> None:
+        with self._slot.use():
+            if not self._inner.ready:
+                self._inner.load()
+            return self._inner.transcribe_streaming(samples, on_segment)
+
+
+# Only the app's actual default (Settings.kt DEFAULT_STT-equivalent) loads
+# eagerly here - the original three-size A/B set (see host3's git history)
+# was for comparing sizes live while the feature was new, not a hard
+# requirement, and eagerly loading all three plus Kokoro plus Chatterbox
+# doesn't fit in this VM's 6GB: confirmed live 2026-09-19, the service
+# OOM-looped 97 times in this VM's guest kernel before settling on trimming
+# this. Re-add a size here (and bump ai1's RAM in qemu-ai1.service to
+# match) if you actually need to compare them again.
 #
 # whisper-medium-gpu added the same day, right after: the CPU-only
 # constraint here was never actually a hard CUDA-version wall the way
@@ -336,12 +518,24 @@ class WhisperEngine:
 # installed (needs LD_LIBRARY_PATH set at process launch, see
 # ai1-tts-stt-server.service.example). Once that's set, GPU medium
 # transcribes in ~0.5-0.6s regardless of clip length (vs ~13s on CPU) -
-# device_index=1 specifically to land on the second, otherwise-idle
-# GPU in this VM rather than contending with Chatterbox on GPU 0.
+# device_index=1 specifically to land on the second GPU in this VM
+# rather than contending with the primary Chatterbox instance on GPU 0.
+# Registered with the gpu-model-manager arbiter (see RemoteGpuModel above)
+# rather than loaded unconditionally: a second Chatterbox instance and
+# ai1's separate image-gen process also want this card now, so this model
+# gets evicted/reloaded on demand instead of staying permanently resident.
+_whisper_medium_gpu = WhisperEngine("whisper-medium-gpu", "medium", "cuda", "int8", device_index=1)
+_whisper_gpu1_slot = RemoteGpuModel(
+    "gpu1", "whisper-medium-gpu",
+    f"http://127.0.0.1:{BIND_PORT}/internal/gpu/evict/whisper-medium-gpu",
+    _whisper_medium_gpu.unload,
+)
+GPU1_PARTICIPANTS["whisper-medium-gpu"] = _whisper_gpu1_slot
+
 STT_ENGINES = {
     "whisper-small-cpu": WhisperEngine("whisper-small-cpu", "small", "cpu", "int8"),
     "whisper-medium-cpu": WhisperEngine("whisper-medium-cpu", "medium", "cpu", "int8"),
-    "whisper-medium-gpu": WhisperEngine("whisper-medium-gpu", "medium", "cuda", "int8", device_index=1),
+    "whisper-medium-gpu": SlotWhisperProxy(_whisper_gpu1_slot, _whisper_medium_gpu),
 }
 
 
@@ -351,7 +545,22 @@ STT_ENGINES = {
 def status():
     out = {name: ("ready" if e.ready else "loading") for name, e in ENGINES.items()}
     out.update({name: ("ready" if e.ready else "loading") for name, e in STT_ENGINES.items()})
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{GPU_MANAGER_URL}/status", timeout=2) as resp:
+            out["gpu1_resident"] = json.loads(resp.read()).get("gpu1", {}).get("resident")
+    except Exception:
+        out["gpu1_resident"] = "unknown (arbiter unreachable)"
     return out
+
+
+@app.post("/internal/gpu/evict/{model}")
+def gpu_evict(model: str):
+    participant = GPU1_PARTICIPANTS.get(model)
+    if participant is None:
+        return JSONResponse({"error": f"unknown model {model!r}"}, status_code=404)
+    participant.evict()
+    return {"ok": True}
 
 
 @app.get("/stt/models")
@@ -544,6 +753,8 @@ async def tts_stream(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         try:
             await websocket.send_json({"type": "error", "message": f"{e.__class__.__name__}: {e}"})
         except Exception:
