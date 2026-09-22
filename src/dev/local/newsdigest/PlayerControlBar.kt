@@ -44,6 +44,14 @@ class PlayerControlBar(
     onForward: () -> Unit,
     onNextSection: () -> Unit,
     onSpeedClick: (anchor: View) -> Unit,
+    // Ends the session outright (ReadAloudController.stop(), not pause()) --
+    // asked for explicitly 2026-09-22: this row had play/pause/seek/section-
+    // skip/speed but no way to actually end a read short of leaving the
+    // screen. Placed at the end of the icon row, visually separate from the
+    // seek/section controls, since it's a different kind of action (ends the
+    // session, not a transport control within it). Kept in sync with
+    // claude-agents-android's copy of this file.
+    onStop: () -> Unit = {},
     // Scrolls the content view to wherever read-aloud is currently at --
     // asked for explicitly 2026-09-10: on a long article/overview it's
     // easy to lose track of the live position while scrolling around.
@@ -111,6 +119,7 @@ class PlayerControlBar(
         val nextSectionButton = iconImageView(context, "ic_next_section", 32) { onNextSection() }
         val locateButton = iconImageView(context, "ic_locate", 22) { onLocate() }
         speedButton = iconButton("1x") { onSpeedClick(speedButton) }
+        val stopButton = iconImageView(context, "ic_stop", 28) { onStop() }
 
         positionLabel = TextView(context).apply {
             textSize = 11f
@@ -163,6 +172,7 @@ class PlayerControlBar(
             addView(nextSectionButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(locateButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(speedButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(stopButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
 
         view = LinearLayout(context).apply {

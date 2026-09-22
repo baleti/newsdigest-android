@@ -141,6 +141,16 @@ class TtsPlaybackService : Service() {
     private var mediaSession: MediaSession? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentTitle: String = "News Digest"
+    // Whatever Intent DetailActivity.readAloud.start() was called from,
+    // captured as-is and replayed verbatim when the notification is
+    // tapped -- see startSession()'s own doc for why this is a captured
+    // Intent rather than a reconstructed id: DetailActivity handles two
+    // unrelated content shapes (a digest entry: date/runId/topic/overview/
+    // markdown/references, vs. a single feed article: title/summary/
+    // feedTitle/link), so replaying the ORIGINAL intent that got the
+    // reader there is simpler and more robust than duplicating either
+    // reconstruction here.
+    private var reopenIntent: Intent? = null
     @Volatile private var lastSentenceText: String = "Preparing..."
     // A rough word-count-based guess of the whole session's length, set
     // by the caller right after startSession() (see setEstimatedDuration)
@@ -271,11 +281,12 @@ class TtsPlaybackService : Service() {
         listener = l
     }
 
-    fun startSession(title: String) {
+    fun startSession(title: String, reopenIntent: Intent? = null) {
         sessionGeneration++ // invalidate any onQueueIdle already queued from a stop before this
         hasActiveSession = true
         requestAudioFocus()
         currentTitle = title
+        this.reopenIntent = reopenIntent
         stopRequested = false
         idleSignaled = false
         sessionEnded = false
@@ -582,11 +593,24 @@ class TtsPlaybackService : Service() {
             }
             val track = audioTrack ?: continue
 
-            setPlaying(true)
-            track.play()
+            // Only actually (re)start the track if we're not sitting
+            // paused - a sentence becoming available after a synthesis gap
+            // must NOT override a pause pressed during that gap. Same fix
+            // as claude-agents-android's copy of this file - confirmed live
+            // 2026-09-22 there, this used to force setPlaying(true)/
+            // track.play() unconditionally here regardless of the user's
+            // actual pause state. The write loop below already correctly
+            // stalls on `!playing` once a sentence IS playing - this was
+            // the one place that didn't check it first.
             val sentenceStartMs = positionMsUpTo(index)
-            setPositionAnchor(sentenceStartMs + startOffsetMs, true)
-            updatePlaybackState(PlaybackState.STATE_PLAYING)
+            if (playing) {
+                track.play()
+                setPositionAnchor(sentenceStartMs + startOffsetMs, true)
+                updatePlaybackState(PlaybackState.STATE_PLAYING)
+            } else {
+                setPositionAnchor(sentenceStartMs + startOffsetMs, false)
+                updatePlaybackState(PlaybackState.STATE_PAUSED)
+            }
             mainHandler.post {
                 listener?.onSentenceStart(current.text, current.words, sentenceStartMs)
                 updateNotification(current.text)
@@ -742,7 +766,7 @@ class TtsPlaybackService : Service() {
             actionPendingIntent(ACTION_STOP),
         ).build()
 
-        return Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle(currentTitle)
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_media_play)
@@ -776,7 +800,16 @@ class TtsPlaybackService : Service() {
             // resume and the notification reappears in a paused state
             // instead of vanishing into an orphaned foreground service.
             .setDeleteIntent(actionPendingIntent(ACTION_PAUSE))
-            .build()
+        // Tapping the notification opens the article/digest actually
+        // playing, not just the app generically -- asked for explicitly
+        // 2026-09-20. See reopenIntent's own doc for why this replays the
+        // captured launch Intent rather than reconstructing one.
+        reopenIntent?.let { intent ->
+            builder.setContentIntent(
+                PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE),
+            )
+        }
+        return builder.build()
     }
 
     private fun actionPendingIntent(action: String): PendingIntent {

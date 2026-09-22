@@ -317,7 +317,7 @@ class ReadAloudController(
     // top to bottom either way (see below); only the actual TTS stream
     // (streamText, at the very end of this function) begins partway
     // through, at the saved character offset, rather than at 0.
-    fun start(title: String, text: CharSequence, startOffset: Int = 0) {
+    fun start(title: String, text: CharSequence, startOffset: Int = 0, reopenIntent: android.content.Intent? = null) {
         stop()
         fullText = text.toString()
         sectionStarts = splitIntoSections(fullText)
@@ -375,7 +375,7 @@ class ReadAloudController(
         // vanished the moment the launching screen's onDestroy() ran
         // unbind(), even with the stop() call already removed from it.
         context.startForegroundService(Intent(context, TtsPlaybackService::class.java))
-        svc.startSession(title)
+        svc.startSession(title, reopenIntent)
         val resumeText = fullText.substring(clampedStart)
         // Rough upfront guess of the REMAINING length (not the whole
         // article, when resuming) so the system media notification has an
@@ -612,6 +612,12 @@ class ReadAloudController(
         ws?.close()
         ws = null
         ttsService?.stopAll()
+        // Explicit, synchronous notification - see claude-agents-android's
+        // copy of this file for the full reasoning: stopAll()'s own async
+        // onQueueIdle callback checks `if (active)` before firing
+        // onStateChanged(false), but `active` is already false by the time
+        // that runs, so it silently never fires without this.
+        onStateChanged.invoke(false)
     }
 
     fun pause() = ttsService?.pause()

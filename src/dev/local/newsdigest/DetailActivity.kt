@@ -278,6 +278,7 @@ class DetailActivity : Activity() {
                     playerBar.setSpeed(speed)
                 }
             },
+            onStop = { readAloud.stop() },
             onLocate = { scrollToCurrentReading() },
             getPosition = { readAloud.getPositionMs() },
             getDuration = { readAloud.getDurationMs() },
@@ -742,7 +743,13 @@ class DetailActivity : Activity() {
             } else {
                 rawContent
             }
-            readAloud.start(sourceTitle, renderedText, startOffset = resumeOffset ?: 0)
+            // A clone, not the live `intent` object itself -- FLAG_ACTIVITY_NEW_TASK
+            // is required for a PendingIntent.getActivity() fired from a
+            // background service context, and mutating this Activity's own
+            // intent field in place to add it would be an unrelated,
+            // avoidable side effect.
+            val reopenIntent = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            readAloud.start(sourceTitle, renderedText, startOffset = resumeOffset ?: 0, reopenIntent = reopenIntent)
         }
     }
 
