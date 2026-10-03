@@ -110,7 +110,7 @@ class MainActivity : Activity() {
             listView.adapter = null
             return
         }
-        if (entries.isEmpty()) load()
+        load()
     }
 
     override fun onBackPressed() {
@@ -207,9 +207,23 @@ class MainActivity : Activity() {
         startActivity(intent)
     }
 
+    /** Called on every resume, not just the first: a background refresh, once
+     * `entries` is already populated, so a new digest generated while the
+     * app sat resumed-but-idle (or backgrounded) actually shows up on the
+     * next foreground instead of the list staying frozen at whatever
+     * `entries` held on the very first load (reported live 2026-09-21: "i
+     * still dont see todays news digest in the app" - the app's own earlier
+     * fetch had simply predated that day's generation run finishing, and
+     * nothing after the first load ever re-fetched). A refresh failure only
+     * surfaces to the user if there was nothing on screen yet - once a list
+     * is showing, a transient network hiccup on a later resume shouldn't
+     * yank it away. */
     private fun load() {
-        statusView.visibility = View.VISIBLE
-        statusView.text = "Loading..."
+        val firstLoad = entries.isEmpty()
+        if (firstLoad) {
+            statusView.visibility = View.VISIBLE
+            statusView.text = "Loading..."
+        }
         Thread {
             try {
                 val result = fetchDigests()
@@ -225,10 +239,12 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "load failed", e)
-                runOnUiThread {
-                    statusView.visibility = View.VISIBLE
-                    statusView.text = "Failed to load: ${e.message}"
-                    Toast.makeText(this, "Load failed - check WireGuard connection", Toast.LENGTH_LONG).show()
+                if (firstLoad) {
+                    runOnUiThread {
+                        statusView.visibility = View.VISIBLE
+                        statusView.text = "Failed to load: ${e.message}"
+                        Toast.makeText(this, "Load failed - check WireGuard connection", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }.start()
