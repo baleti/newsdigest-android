@@ -874,11 +874,31 @@ async def tts_stream(websocket: WebSocket):
         status_task = asyncio.create_task(forward_status())
         status_q.put_nowait({"message": f"Starting {engine_name}: {len(sentences)} sentences to synthesize", "sentence": 0, "of": len(sentences)})
 
+        # Sentences synthesize in parallel (lookahead pipeline), so their
+        # steps interleave and would read as noise ("[31] generating, [30]
+        # waiting for GPU, ..."). Only the sentence playback is actually
+        # blocked on - the next one to be SENT - is forwarded live; the
+        # others' latest step is parked and replayed the moment they
+        # become the blocking one.
+        blocking = {"idx": 0}
+        latest: dict[int, dict] = {}
+
+        def on_status(idx: int, total: int, message: str) -> None:
+            item = {"message": message, "sentence": idx + 1, "of": total}
+            latest[idx] = item
+            if idx == blocking["idx"]:
+                status_q.put_nowait(item)
+
+        def advance_blocking(new_idx: int) -> None:
+            latest.pop(blocking["idx"], None)
+            blocking["idx"] = new_idx
+            item = latest.get(new_idx)
+            if item is not None:
+                status_q.put_nowait(item)
+
         def make_emit(idx: int, total: int):
             def emit(message: str) -> None:
-                loop.call_soon_threadsafe(
-                    status_q.put_nowait, {"message": message, "sentence": idx + 1, "of": total},
-                )
+                loop.call_soon_threadsafe(on_status, idx, total, message)
             return emit
 
         pending: dict[int, asyncio.Task] = {}
@@ -964,6 +984,7 @@ async def tts_stream(websocket: WebSocket):
                 async with send_lock:
                     sent_ms += await _send_sentence(websocket, pcm, meta)
                 next_to_send += 1
+                advance_blocking(next_to_send)
                 fill_pipeline()
 
             await websocket.send_json({"type": "done"})

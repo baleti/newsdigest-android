@@ -18,8 +18,8 @@ import android.widget.TextView
  * Besides the countdown (ReadAloudController's rolling average of observed
  * synth_ms, clamped at "~1s"), it shows the server's own step-by-step
  * `status` messages (see server.py's _progress) as a short multiline log:
- * finished steps above, the current one last with how long it has been
- * running. Two anti-flicker rules, asked for explicitly 2026-10-04:
+ * the sentence it is waiting on ("sentence 30 of 135"), its finished steps
+ * marked ✓ and the current one marked ▸ with how long it has been running. Two anti-flicker rules, asked for explicitly 2026-10-04:
  *  - it only appears once the wait has lasted SHOW_DELAY_MS, so the
  *    split-second gaps between sentences mid-read never show it;
  *  - once shown it stays for at least MIN_VISIBLE_MS.
@@ -38,14 +38,18 @@ class SynthesizingBanner(context: Context) {
     private companion object {
         const val SHOW_DELAY_MS = 1200L
         const val MIN_VISIBLE_MS = 1500L
-        const val MAX_LINES = 5
-        const val LINE_MAX_AGE_MS = 25_000L
+        const val MAX_LINES = 4
     }
 
-    private class Step(val text: String, val sentence: Int, val of: Int, val atNanos: Long)
+    private class Step(val text: String, val atNanos: Long)
 
     private val handler = Handler(Looper.getMainLooper())
+    // Steps of the ONE sentence playback is currently blocked on (the
+    // server only forwards that one - see server.py's blocking/on_status).
+    // Everything but the last is finished; the last is in progress.
     private val steps = ArrayList<Step>()
+    private var sentence = 0
+    private var sentenceCount = 0
     private var waiting = false
     private var deadlineAtNanos = 0L
     private var visibleSinceNanos = 0L
@@ -71,14 +75,14 @@ class SynthesizingBanner(context: Context) {
         val now = System.nanoTime()
         val remainingMs = (deadlineAtNanos - now) / 1_000_000
         val displaySec = ((remainingMs + 999) / 1000).coerceAtLeast(1) // round up, never show 0
-        val sb = StringBuilder("Synthesizing… ~${displaySec}s")
-        val recent = steps.filter { (now - it.atNanos) / 1_000_000 <= LINE_MAX_AGE_MS }.takeLast(MAX_LINES)
-        for ((i, step) in recent.withIndex()) {
-            val last = i == recent.lastIndex
-            sb.append('\n').append(if (last) "▸ " else "· ")
-            if (step.sentence > 0) sb.append('[').append(step.sentence).append('/').append(step.of).append("] ")
-            sb.append(step.text)
-            if (last) {
+        val sb = StringBuilder("Synthesizing")
+        if (sentence > 0) sb.append(" sentence ").append(sentence).append(" of ").append(sentenceCount)
+        sb.append(" · ~").append(displaySec).append('s')
+        val shown = steps.takeLast(MAX_LINES)
+        for ((i, step) in shown.withIndex()) {
+            val current = i == shown.lastIndex
+            sb.append('\n').append(if (current) "▸ " else "✓ ").append(step.text)
+            if (current) {
                 val sec = (now - step.atNanos) / 1_000_000_000
                 if (sec >= 2) sb.append(" (").append(sec).append("s)")
             }
@@ -88,10 +92,13 @@ class SynthesizingBanner(context: Context) {
 
     /** A step message from the server's `status` event. Safe to call while
      * the banner is hidden - it is kept for when the banner next appears. */
-    fun addStatus(message: String, sentence: Int = 0, of: Int = 0) {
-        if (steps.lastOrNull()?.text == message && steps.last().sentence == sentence) return
-        steps.add(Step(message, sentence, of, System.nanoTime()))
-        while (steps.size > 20) steps.removeAt(0)
+    fun addStatus(message: String, sentenceNo: Int = 0, of: Int = 0) {
+        // A different sentence (or the "Starting..." message of a new read,
+        // sentence 0) means the previous sentence's steps are history.
+        if (sentenceNo != sentence || sentenceNo == 0) steps.clear()
+        sentence = sentenceNo
+        sentenceCount = of
+        if (steps.lastOrNull()?.text != message) steps.add(Step(message, System.nanoTime()))
         if (view.visibility == View.VISIBLE) render()
     }
 
