@@ -110,3 +110,21 @@ class LocalTts(context: Context) {
 
     companion object { private const val TAG = "LocalTts" }
 }
+
+
+/** What the on-device TTS should actually say for a sentence: the server
+ * strips markdown before synthesizing (text_clean.markdown_to_speech), but
+ * the local bridge speaks the client's own text, so without this it read
+ * "##Recommended" as "hash hash recommended" (also asterisks, backticks,
+ * bullet dashes, raw URLs). Display/highlight text stays untouched - only
+ * what is passed to the engine changes. */
+internal fun speakableForLocalTts(s: String): String {
+    var t = s
+    t = t.replace(Regex("(?m)(^|\\s)#{2,6}\\s*"), "\$1")
+    t = t.replace(Regex("(?m)^\\s*#\\s+"), "")
+    t = t.replace(Regex("(?m)^\\s*[-*\u2022]\\s+"), "")
+    t = t.replace(Regex("\\*{1,3}|`+"), "")
+    t = t.replace(Regex("https?://\\S+"), "link")
+    t = t.replace(Regex("\\s+"), " ").trim()
+    return if (t.isEmpty()) s else t
+}

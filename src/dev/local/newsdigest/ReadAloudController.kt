@@ -585,7 +585,7 @@ class ReadAloudController(
                     while (i > 0 && isCurrent() && !serverTookOver && svc.bufferedAheadMs() > 700) Thread.sleep(100)
                     if (!isCurrent() || serverTookOver) return@Thread
                     val sentence = text.substring(range)
-                    val audio = local.synthesize(sentence) ?: return@Thread
+                    val audio = local.synthesize(speakableForLocalTts(sentence)) ?: return@Thread
                     synchronized(feedLock) {
                         if (!isCurrent() || serverTookOver) return@Thread
                         svc.enqueueSentence(sentence, estimateWordTimings(sentence, audio), audio.pcm, audio.sampleRate)
