@@ -520,7 +520,9 @@ def _load_engine_background(engine):
 # nothing about moving hosts fixes it. Revisit only if ctranslate2 ships
 # a build matching whatever CUDA this VM ends up on.
 
-STT_MAX_BYTES = 16_000 * 2 * 120  # 16kHz, 16-bit mono, 2 minutes - generous for a dictated chat message
+STT_MAX_BYTES = 16_000 * 2 * 60 * 15  # 16kHz, 16-bit mono, 15 minutes - not removed outright even though
+# this endpoint is already gated to loopback/ALLOWED_SUBNET (_security_ok): a generous but still-bounded
+# cap is cheap insurance against an oversized body wedging memory if that gate were ever bypassed by a bug.
 
 
 class WhisperEngine:
