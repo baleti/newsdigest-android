@@ -66,6 +66,9 @@ class ReadAloudController(
     // loading a model, waiting on the GPU, generating...) - see
     // SynthesizingBanner.addStatus. Optional.
     private val onStatus: (message: String, sentence: Int, of: Int) -> Unit = { _, _, _ -> },
+    // Fires when a sentence starts playing: true = spoken by the phone's own
+    // TTS (the bridge), false = by the server's engine. See VoiceIndicator.
+    private val onVoiceSource: (local: Boolean) -> Unit = {},
 ) {
     private var ttsService: TtsPlaybackService? = null
     private var bound = false
@@ -132,9 +135,15 @@ class ReadAloudController(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Texts of sentences the phone's own TTS spoke (guarded by itself) - how
+    // onSentenceStart tells a local sentence from a server one.
+    private val localSpoken = java.util.Collections.synchronizedSet(HashSet<String>())
+
     private val highlightListener = object : TtsPlaybackService.HighlightListener {
         override fun onSentenceStart(text: String, words: List<WordTiming>, startMs: Long) {
+            val local = localSpoken.contains(text)
             mainHandler.post {
+                onVoiceSource(local)
                 onGenerating(false, 0L)
                 // Locate this sentence inside the text that's already on
                 // screen rather than appending it - the server's sentence
@@ -345,6 +354,7 @@ class ReadAloudController(
         stop()
         fullText = text.toString()
         sectionStarts = splitIntoSections(fullText)
+        localSpoken.clear()
         knownWords.clear()
         captionBuilder.clear()
         captionBuilder.append(text) // shown in full immediately - reading only ever highlights within this, never replaces it
@@ -588,6 +598,7 @@ class ReadAloudController(
                     val audio = local.synthesize(speakableForLocalTts(sentence)) ?: return@Thread
                     synchronized(feedLock) {
                         if (!isCurrent() || serverTookOver) return@Thread
+                        localSpoken.add(sentence)
                         svc.enqueueSentence(sentence, estimateWordTimings(sentence, audio), audio.pcm, audio.sampleRate)
                         localEnd = range.last + 1
                     }

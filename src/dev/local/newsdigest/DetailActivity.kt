@@ -69,6 +69,7 @@ class DetailActivity : Activity() {
     private var sectionMarkers: List<Pair<Int, String>> = emptyList()
     private lateinit var contentView: TextView
     private lateinit var synthBanner: SynthesizingBanner
+    private lateinit var voiceIndicator: VoiceIndicator
     private lateinit var playerBar: PlayerControlBar
     private lateinit var readAloudButton: Button
     private lateinit var resumeButton: Button
@@ -182,6 +183,8 @@ class DetailActivity : Activity() {
                     mainHandler.postDelayed(positionSaveTick, 5_000)
                 } else {
                     playerBar.hide()
+                    voiceBegun = false
+                    voiceIndicator.end()
                     setHeaderVisible(true)
                     // The readAloudButton that could trigger a manual stop
                     // was removed entirely (asked for explicitly 2026-09-09:
@@ -220,8 +223,11 @@ class DetailActivity : Activity() {
             },
             onGenerating = { generating, estimatedMs ->
                 if (generating) synthBanner.start(estimatedMs) else synthBanner.stop()
+                // First "waiting for audio" of a read = the start of this read.
+                if (generating && !voiceBegun) { voiceBegun = true; voiceIndicator.begin(estimatedMs) }
             },
-            onStatus = { message, sentence, of -> synthBanner.addStatus(message, sentence, of) },
+            onVoiceSource = { local -> voiceIndicator.onSentenceSource(local) },
+            onStatus = { message, sentence, of -> synthBanner.addStatus(message, sentence, of); voiceIndicator.onStep(message) },
             onPlayingChanged = { playing ->
                 isPlaying = playing
                 playerBar.setPlaying(playing)
@@ -298,6 +304,8 @@ class DetailActivity : Activity() {
         )
         outer.addView(playerBar.view)
 
+        voiceIndicator = VoiceIndicator(this) { if (Settings.getTtsEngine(this) == "chatterbox") "Chatterbox" else "Kokoro" }
+        outer.addView(voiceIndicator.view)
         synthBanner = SynthesizingBanner(this)
         outer.addView(synthBanner.view) // above the ScrollView, not inside it - stays visible regardless of scroll position
 
@@ -680,6 +688,7 @@ class DetailActivity : Activity() {
     }
 
     private var lastUserScrollMs = 0L
+    private var voiceBegun = false
 
     /** Title/date/overview views - hidden while the live caption (which
      * repeats all three) is showing. */
