@@ -398,6 +398,12 @@ class TtsPlaybackService : Service() {
      * build relative seek ("skip back/forward 15s") on top of seekTo(). */
     fun getPositionMs(): Long = estimatedPositionMs()
 
+    /** How much already-enqueued audio is still ahead of the playhead, ms.
+     * Lets the local-TTS bridge (ReadAloudController) decide when it must
+     * synthesize another sentence to avoid a silent gap. */
+    fun bufferedAheadMs(): Long =
+        (positionMsUpTo(synchronized(lock) { allSentences.size }) - estimatedPositionMs()).coerceAtLeast(0L)
+
     // Same "whichever is bigger" duration the media session's own metadata
     // already shows (see enqueueSentence/setEstimatedDuration) - exposed
     // here too so an in-app scrubber can show the identical number rather

@@ -1,6 +1,6 @@
 package dev.local.newsdigest
 
-import android.text.Spannable
+import android.text.Spanned
 import android.text.style.ClickableSpan
 import android.util.Log
 import android.view.MotionEvent
@@ -40,15 +40,25 @@ object LinkTapHandler {
                 MotionEvent.ACTION_UP -> {
                     val movedPx = maxOf(abs(event.x - downX), abs(event.y - downY))
                     val elapsedMs = event.eventTime - downTime
-                    // Temporary diagnostic logging (2026-09-10) - word-tap-
-                    // seek has been reported not working twice now with no
-                    // obvious cause found by reading the code, so this
-                    // pins down exactly which branch a real tap actually
-                    // takes instead of guessing further blind.
+                    // Root cause found live 2026-09-20: this checked
+                    // `as? Spannable`, but a plain `textView.text = x`
+                    // assignment (BufferType.NORMAL, the default) copies
+                    // any Spanned source into an immutable SpannedString
+                    // -- spans survive the copy (SpannedString still
+                    // implements Spanned), but SpannedString does NOT
+                    // implement the separate, stricter Spannable interface
+                    // (mutation methods this code never needed anyway,
+                    // getSpans() is on Spanned), so the cast silently
+                    // returned null on every real tap. This is why link
+                    // taps (and word-tap-seek) were reported broken twice
+                    // before with "no obvious cause found by reading the
+                    // code" -- the diagnostic logging below is what
+                    // finally caught it (tap registered, but
+                    // spannable=null).
                     if (movedPx < TAP_SLOP_PX && elapsedMs < TAP_MAX_MS) {
                         val tv = view as TextView
                         val layout = tv.layout
-                        val spannable = tv.text as? Spannable
+                        val spannable = tv.text as? Spanned
                         if (layout != null && spannable != null) {
                             val x = (event.x.toInt() - tv.totalPaddingLeft + tv.scrollX).toFloat()
                             val y = event.y.toInt() - tv.totalPaddingTop + tv.scrollY

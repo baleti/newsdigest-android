@@ -254,7 +254,12 @@ class ReadAloudController(
         }
     }
 
+    // Phone's own TTS, pre-initialised here so a tap on "Read aloud" can
+    // start speaking within a few hundred ms - see streamText().
+    private var localTts: LocalTts? = null
+
     fun bind() {
+        if (localTts == null) localTts = try { LocalTts(context) } catch (e: Exception) { null }
         context.bindService(Intent(context, TtsPlaybackService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
 
@@ -266,6 +271,8 @@ class ReadAloudController(
      * behaves. Call stop() explicitly first (e.g. the toolbar's own Stop
      * action already does) if leaving really should end the read. */
     fun unbind() {
+        localTts?.shutdown()
+        localTts = null
         if (bound) {
             try { context.unbindService(connection) } catch (_: Exception) {}
             bound = false
@@ -531,6 +538,48 @@ class ReadAloudController(
             mainHandler.postDelayed({ reportPosition(client) }, 500)
         }
 
+        // --- Local-TTS bridge -------------------------------------------
+        // The server can take 10-20s to produce its first sentence (cold
+        // Chatterbox, GPU model eviction). So the phone's own TTS speaks
+        // the first sentence(s) at once, and the server stream is asked to
+        // start AFTER that sentence rather than redo it. If the server is
+        // still behind when the local audio runs low, local speaks the
+        // next sentence too. The moment a server sentence lands past what
+        // local covered, local stops for good (feedLock keeps the two
+        // producers from interleaving out of order); server sentences that
+        // arrive for text local already covered are dropped.
+        val feedLock = Any()
+        var serverTookOver = false
+        var localEnd = 0 // char offset into `text` that local audio has covered
+        val local = localTts?.takeIf { it.isReady() }
+        val localSentences = if (local != null) splitLocalSentences(text) else emptyList()
+        // Server gets the text after the first local sentence; with no
+        // local engine it gets everything, exactly as before.
+        val wsOffset = localSentences.firstOrNull()?.last?.plus(1) ?: 0
+        var serverCursor = wsOffset
+        var serverFailed = false
+
+        if (local != null && localSentences.isNotEmpty()) {
+            Thread {
+                for ((i, range) in localSentences.withIndex()) {
+                    if (!isCurrent() || serverTookOver) return@Thread
+                    // First sentence immediately; later ones only when the
+                    // already-queued audio is nearly spent.
+                    while (i > 0 && isCurrent() && !serverTookOver && svc.bufferedAheadMs() > 700) Thread.sleep(100)
+                    if (!isCurrent() || serverTookOver) return@Thread
+                    val sentence = text.substring(range)
+                    val audio = local.synthesize(sentence) ?: return@Thread
+                    synchronized(feedLock) {
+                        if (!isCurrent() || serverTookOver) return@Thread
+                        svc.enqueueSentence(sentence, estimateWordTimings(sentence, audio), audio.pcm, audio.sampleRate)
+                        localEnd = range.last + 1
+                    }
+                }
+                // Local covered everything (server dead or hopelessly slow).
+                synchronized(feedLock) { if (isCurrent() && !serverTookOver) svc.endSession() }
+            }.apply { isDaemon = true; name = "ReadAloudLocalTts"; start() }
+        }
+
         wsThread = Thread {
             val client = WebSocketClient(
                 Settings.getHost(context),
@@ -544,16 +593,16 @@ class ReadAloudController(
 
                 override fun onOpen() {
                     client.sendText(JSONObject().apply {
-                        put("text", text)
+                        put("text", text.substring(wsOffset).trimStart())
                         put("engine", Settings.getTtsEngine(context))
                         Settings.getTtsVoice(context)?.let { put("voice", it) }
                     }.toString())
                     mainHandler.post { reportPosition(client) }
                 }
 
-                override fun onText(text: String) {
+                override fun onText(msg: String) {
                     if (!isCurrent()) return
-                    val obj = JSONObject(text)
+                    val obj = JSONObject(msg)
                     when (obj.optString("type")) {
                         "sentence" -> pendingMeta = obj
                         "done" -> {
@@ -563,10 +612,14 @@ class ReadAloudController(
                             // when onQueueIdle actually fires, rather than
                             // flipping the UI to "stopped" the instant the
                             // server finishes generating.
-                            svc.endSession()
+                            // Local bridge may still be mid-way through covering
+                            // text itself if the server finished/dropped everything.
+                            synchronized(feedLock) { if (serverTookOver || localSentences.isEmpty()) svc.endSession() }
                         }
                         "error" -> {
                             Log.e("ReadAloudController", "server error: ${obj.optString("message")}")
+                            // Local TTS keeps reading on its own if it's running
+                            if (localSentences.isNotEmpty() && !serverTookOver) { serverFailed = true; return }
                             svc.endSession()
                             mainHandler.post {
                                 if (active) {
@@ -589,13 +642,22 @@ class ReadAloudController(
                             words.add(WordTiming(w.getString("word"), w.getInt("start_ms"), w.getInt("end_ms")))
                         }
                     }
-                    svc.enqueueSentence(meta.getString("text"), words, data, meta.getInt("sample_rate"))
+                    val sText = meta.getString("text")
+                    synchronized(feedLock) {
+                        val idx = text.indexOf(sText, serverCursor)
+                        if (idx >= 0) serverCursor = idx + sText.length
+                        // Local already spoke this one - drop the server's copy.
+                        if (idx >= 0 && idx + sText.length <= localEnd) return
+                        serverTookOver = true
+                        svc.enqueueSentence(sText, words, data, meta.getInt("sample_rate"))
+                    }
                     recordSynthMs(meta.optLong("synth_ms", -1))
                 }
 
                 override fun onFailure(error: Throwable) {
                     if (!isCurrent()) return // expected: skipAheadTo()'s ws.close() surfaces as a failure on the abandoned stream
                     Log.e("ReadAloudController", "websocket failed", error)
+                    if (localSentences.isNotEmpty() && !serverTookOver) { serverFailed = true; return } // local carries on
                     mainHandler.post {
                         active = false
                         onStateChanged.invoke(false)
@@ -603,6 +665,38 @@ class ReadAloudController(
                 }
             })
         }.apply { isDaemon = true; name = "ReadAloudWs"; start() }
+    }
+
+    /** Sentence char ranges within `text`, split like server.py's
+     * split_sentences (sentence-ending punctuation + whitespace, and blank
+     * lines) so local and server agree on where sentences begin. */
+    private fun splitLocalSentences(text: String): List<IntRange> {
+        val out = mutableListOf<IntRange>()
+        var start = -1
+        var i = 0
+        while (i < text.length) {
+            if (start < 0 && !text[i].isWhitespace()) start = i
+            val boundary = start >= 0 && text[i].isWhitespace() && i > 0 &&
+                (text[i - 1] in ".!?" || (text[i] == '\n' && i + 1 < text.length && text[i + 1] == '\n'))
+            if (boundary) { out.add(start..(i - 1)); start = -1 }
+            i++
+        }
+        if (start >= 0) out.add(start..text.trimEnd().length - 1)
+        return out.filter { it.last >= it.first }
+    }
+
+    /** Same char-proportional word timings server.py's
+     * estimate_word_timings produces. */
+    private fun estimateWordTimings(sentence: String, audio: LocalTts.Audio): List<WordTiming> {
+        val words = sentence.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (words.isEmpty()) return emptyList()
+        val totalMs = audio.pcm.size / 2 * 1000.0 / audio.sampleRate
+        val totalChars = words.sumOf { maxOf(it.length, 1) }
+        var cursor = 0.0
+        return words.map { w ->
+            val dur = totalMs * maxOf(w.length, 1) / totalChars
+            WordTiming(w, cursor.toInt(), (cursor + dur).toInt()).also { cursor += dur }
+        }
     }
 
     fun stop() {
