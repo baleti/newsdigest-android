@@ -210,6 +210,7 @@ class DetailActivity : Activity() {
             onGenerating = { generating, estimatedMs ->
                 if (generating) synthBanner.start(estimatedMs) else synthBanner.stop()
             },
+            onStatus = { message, sentence, of -> synthBanner.addStatus(message, sentence, of) },
             onPlayingChanged = { playing ->
                 isPlaying = playing
                 playerBar.setPlaying(playing)

@@ -62,6 +62,10 @@ class ReadAloudController(
     // audio-focus loss/gain - not just ones a caller's own button press
     // caused. Optional - see TtsPlaybackService.HighlightListener.onPlayingChanged.
     private val onPlayingChanged: (playing: Boolean) -> Unit = {},
+    // The server's step-by-step `status` events (what it is doing right now:
+    // loading a model, waiting on the GPU, generating...) - see
+    // SynthesizingBanner.addStatus. Optional.
+    private val onStatus: (message: String, sentence: Int, of: Int) -> Unit = { _, _, _ -> },
 ) {
     private var ttsService: TtsPlaybackService? = null
     private var bound = false
@@ -199,7 +203,7 @@ class ReadAloudController(
         }
 
         override fun onSentenceEnd() {
-            mainHandler.post { onGenerating(true, avgSynthMs) }
+            mainHandler.post { if (active) onGenerating(true, avgSynthMs) }
         }
 
         override fun onPlayingChanged(playing: Boolean) {
@@ -605,6 +609,11 @@ class ReadAloudController(
                     val obj = JSONObject(msg)
                     when (obj.optString("type")) {
                         "sentence" -> pendingMeta = obj
+                        "status" -> {
+                            val m = obj.optString("message")
+                            val k = obj.optInt("sentence"); val n = obj.optInt("of")
+                            mainHandler.post { onStatus(m, k, n) }
+                        }
                         "done" -> {
                             // No more sentences are coming, but whatever's
                             // already queued may still be playing - let

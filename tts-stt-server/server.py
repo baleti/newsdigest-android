@@ -20,6 +20,7 @@ that, same reasoning as the WireGuard-tunnel version had for its own
 network boundary.
 """
 import asyncio
+import contextvars
 import hashlib
 import ipaddress
 import json
@@ -100,6 +101,28 @@ async def security_middleware(request: Request, call_next):
     if not _security_ok(client_host, request.headers):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return await call_next(request)
+
+
+# -------------------------------------------------------------- progress
+#
+# Human-readable "what is the server doing right now" steps, streamed to
+# the client as {"type": "status", "message": ..., "sentence": k, "of": n}
+# so its "Synthesizing..." banner can say more than a countdown (cold model
+# load, waiting on the GPU arbiter, evicting another model, ...). Engine
+# code runs in a worker thread, far from the websocket, so the sink is a
+# ContextVar: tts_stream's per-sentence task sets it, and
+# run_in_threadpool copies the context into the worker thread. Calling
+# _progress() outside a stream (e.g. startup loading) is a no-op.
+_progress_sink: contextvars.ContextVar = contextvars.ContextVar("tts_progress_sink", default=None)
+
+
+def _progress(message: str) -> None:
+    sink = _progress_sink.get()
+    if sink is not None:
+        try:
+            sink(message)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------ text
@@ -244,7 +267,10 @@ class KokoroEngine:
         return [v for v in self._kokoro.get_voices() if v.startswith(("af_", "am_", "bf_", "bm_"))]
 
     def synthesize(self, text: str, voice: str | None) -> tuple[np.ndarray, int]:
+        if self._lock.locked():
+            _progress("Waiting for Kokoro to finish another sentence")
         with self._lock:
+            _progress("Generating speech with Kokoro (CPU)")
             samples, sr = self._kokoro.create(text, voice=voice or "af_heart", speed=1.0, lang="en-us")
         return samples, sr
 
@@ -319,6 +345,7 @@ class ChatterboxEngine:
         if idx == self._prepared_voice_index:
             return
         try:
+            _progress(f"Preparing Chatterbox voice '{voices[idx].stem}'")
             self._model.prepare_conditionals(str(voices[idx]), exaggeration=0.5)
             self._prepared_voice_index = idx
         except Exception as e:
@@ -330,6 +357,7 @@ class ChatterboxEngine:
     def synthesize(self, text: str, voice: str | None) -> tuple[np.ndarray, int]:
         with self._lock:
             self._apply_todays_voice_locked()
+            _progress(f"Generating speech with Chatterbox on {self.device}")
             wav = self._model.generate(text)
         return wav.squeeze().numpy(), self._model.sr
 
@@ -400,7 +428,12 @@ class RemoteGpuModel:
             # the arbiter side (no eviction happens on register), so
             # paying for it on every use is a non-issue.
             self.register()
+            _progress(f"Asking the GPU arbiter for {self.slot} (another model may be evicted)")
+            t0 = time.monotonic()
             _gpu_manager_post("/acquire", {"slot": self.slot, "model": self.model})
+            waited = time.monotonic() - t0
+            if waited >= 1.0:
+                _progress(f"Got {self.slot} after {waited:.0f}s")
             yield
 
     def evict(self) -> None:
@@ -441,12 +474,15 @@ class ChatterboxPool:
         return ["default"]
 
     def synthesize(self, text: str, voice: str | None) -> tuple[np.ndarray, int]:
+        if self._free.empty():
+            _progress("Both Chatterbox instances are busy - waiting for one to free up")
         slot_id = self._free.get()
         try:
             if slot_id == "primary":
                 return self._primary.synthesize(text, voice)
             with self._slot.use():
                 if not self._secondary.ready:
+                    _progress("Loading Chatterbox onto the second GPU (about 15-20s)")
                     self._secondary.load()
                 return self._secondary.synthesize(text, voice)
         finally:
@@ -816,6 +852,35 @@ async def tts_stream(websocket: WebSocket):
                 disconnected.set()
 
         position_task = asyncio.create_task(receive_position_updates())
+
+        # Progress steps from the engines (see _progress): worker threads
+        # push onto status_q thread-safely, one forwarder task relays them.
+        # send_lock keeps a status frame from landing between a sentence's
+        # JSON header and its binary audio frame.
+        loop = asyncio.get_running_loop()
+        status_q: asyncio.Queue = asyncio.Queue()
+        send_lock = asyncio.Lock()
+
+        async def forward_status():
+            last = None
+            while True:
+                item = await status_q.get()
+                if item["message"] == last:
+                    continue
+                last = item["message"]
+                async with send_lock:
+                    await websocket.send_json({"type": "status", **item})
+
+        status_task = asyncio.create_task(forward_status())
+        status_q.put_nowait({"message": f"Starting {engine_name}: {len(sentences)} sentences to synthesize", "sentence": 0, "of": len(sentences)})
+
+        def make_emit(idx: int, total: int):
+            def emit(message: str) -> None:
+                loop.call_soon_threadsafe(
+                    status_q.put_nowait, {"message": message, "sentence": idx + 1, "of": total},
+                )
+            return emit
+
         pending: dict[int, asyncio.Task] = {}
         try:
             sent_ms = 0
@@ -872,7 +937,7 @@ async def tts_stream(websocket: WebSocket):
                     next_to_start += 1
                     pending_estimate_ms += _estimate_sentence_ms(sentences[idx])
                     pending[idx] = asyncio.create_task(
-                        _synthesize_sentence(engine, engine_name, sentences[idx], voice)
+                        _synthesize_sentence(engine, engine_name, sentences[idx], voice, make_emit(idx, n))
                     )
 
             fill_pipeline()
@@ -896,13 +961,15 @@ async def tts_stream(websocket: WebSocket):
                 pending_estimate_ms = max(0.0, pending_estimate_ms - _estimate_sentence_ms(sentences[next_to_send]))
                 if disconnected.is_set():
                     return
-                sent_ms += await _send_sentence(websocket, pcm, meta)
+                async with send_lock:
+                    sent_ms += await _send_sentence(websocket, pcm, meta)
                 next_to_send += 1
                 fill_pipeline()
 
             await websocket.send_json({"type": "done"})
         finally:
             position_task.cancel()
+            status_task.cancel()
             # A client that leaves (stop, skip-ahead, app killed) must not
             # leave its look-ahead sentences queued: they'd keep holding
             # the synthesis semaphore and make the NEXT request wait behind
@@ -928,7 +995,7 @@ async def tts_stream(websocket: WebSocket):
             pass
 
 
-async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: str | None) -> tuple[bytes, dict]:
+async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: str | None, emit=None) -> tuple[bytes, dict]:
     """Just the synthesis half - no websocket I/O - so tts_stream can run
     several of these as concurrent tasks and send the results in order
     once ready. A cache hit intentionally skips the semaphore below (it's
@@ -946,7 +1013,12 @@ async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: s
             "duration_ms": meta["duration_ms"], "synth_ms": 0,
         }
 
-    async with (_kokoro_synthesis_semaphore if engine_name == "kokoro" else _tts_synthesis_semaphore):
+    sem = _kokoro_synthesis_semaphore if engine_name == "kokoro" else _tts_synthesis_semaphore
+    if emit is not None:
+        _progress_sink.set(emit)
+        if sem.locked():
+            emit("Queued behind other sentences already being synthesized")
+    async with sem:
         t0 = time.monotonic()
         samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
         duration_s = len(samples) / sr
