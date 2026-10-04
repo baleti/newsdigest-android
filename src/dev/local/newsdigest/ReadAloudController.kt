@@ -90,6 +90,7 @@ class ReadAloudController(
     private var currentWordRanges: List<IntRange> = emptyList()
     private var highlightSpan: BackgroundColorSpan? = null
     private var lastCaptionPushNanos = 0L
+    private var captionPushScheduled = false
     // Char offset (into fullText/captionBuilder) of whichever word is
     // currently highlighted - null until the first onWordHighlight of a
     // session. Exposed via currentReadingOffset() so a caller can scroll
@@ -198,6 +199,18 @@ class ReadAloudController(
                 if (now - lastCaptionPushNanos >= 150_000_000L) {
                     lastCaptionPushNanos = now
                     onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
+                } else if (!captionPushScheduled) {
+                    // Throttled - but without a trailing push the highlight would
+                    // sit on a stale word until the NEXT change (stutter), so
+                    // flush the latest state once the throttle window ends.
+                    captionPushScheduled = true
+                    mainHandler.postDelayed({
+                        captionPushScheduled = false
+                        if (active) {
+                            lastCaptionPushNanos = System.nanoTime()
+                            onCaptionChanged.invoke(SpannableStringBuilder(captionBuilder))
+                        }
+                    }, 150)
                 }
             }
         }
