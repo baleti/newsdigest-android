@@ -756,6 +756,9 @@ def voices(engine: str = "kokoro"):
 TTS_LOOKAHEAD_CAP_MS = 30_000
 TTS_MAX_CONCURRENT_SYNTHESIS = 2
 _tts_synthesis_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT_SYNTHESIS)
+# Kokoro is CPU/onnx, Chatterbox is GPU - a backlog of Chatterbox work must
+# never make a Kokoro request wait, so Kokoro gets its own gate.
+_kokoro_synthesis_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT_SYNTHESIS)
 
 
 def _estimate_sentence_ms(sentence: str) -> float:
@@ -813,6 +816,7 @@ async def tts_stream(websocket: WebSocket):
                 disconnected.set()
 
         position_task = asyncio.create_task(receive_position_updates())
+        pending: dict[int, asyncio.Task] = {}
         try:
             sent_ms = 0
             n = len(sentences)
@@ -828,7 +832,6 @@ async def tts_stream(websocket: WebSocket):
             # "read aloud is really slow... given that we now have
             # Chatterbox running on both GPUs" - the instances existed,
             # nothing here was ever issuing overlapping requests to use them).
-            pending: dict[int, asyncio.Task] = {}
             next_to_start = 0
             next_to_send = 0
             # Rough duration of sentences currently pending (started, not
@@ -900,6 +903,15 @@ async def tts_stream(websocket: WebSocket):
             await websocket.send_json({"type": "done"})
         finally:
             position_task.cancel()
+            # A client that leaves (stop, skip-ahead, app killed) must not
+            # leave its look-ahead sentences queued: they'd keep holding
+            # the synthesis semaphore and make the NEXT request wait behind
+            # a read nobody is listening to (seen live 2026-10-04: a stopped
+            # Chatterbox read starved a fresh Kokoro one for 30s+).
+            # Cancelling drops everything still queued; only a synthesis
+            # already running in its thread has to finish.
+            for t in pending.values():
+                t.cancel()
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -934,7 +946,7 @@ async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: s
             "duration_ms": meta["duration_ms"], "synth_ms": 0,
         }
 
-    async with _tts_synthesis_semaphore:
+    async with (_kokoro_synthesis_semaphore if engine_name == "kokoro" else _tts_synthesis_semaphore):
         t0 = time.monotonic()
         samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
         duration_s = len(samples) / sr
