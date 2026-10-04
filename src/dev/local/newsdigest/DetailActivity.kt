@@ -161,6 +161,13 @@ class DetailActivity : Activity() {
                 resumeButton.visibility = if (playing) View.GONE else resumeButton.visibility
                 if (playing) {
                     isPlaying = true
+                    // The live caption (contentView) already contains the title
+                    // and overview (see toggleReadAloud), so the separate header
+                    // views would duplicate them and push the caption - where
+                    // the word highlight lives - off the bottom of the screen
+                    // with nothing scrolling to it.
+                    setHeaderVisible(false)
+                    lastUserScrollMs = 0L
                     playerBar.show()
                     playerBar.setPlaying(true)
                     playerBar.setSpeed(readAloud.getSpeed())
@@ -175,6 +182,7 @@ class DetailActivity : Activity() {
                     mainHandler.postDelayed(positionSaveTick, 5_000)
                 } else {
                     playerBar.hide()
+                    setHeaderVisible(true)
                     // The readAloudButton that could trigger a manual stop
                     // was removed entirely (asked for explicitly 2026-09-09:
                     // "remove the stop button... it serves no purpose"), so
@@ -205,7 +213,10 @@ class DetailActivity : Activity() {
             // 2026-09-10), so it's back to plain reassignment here, just
             // less often.
             onCaptionChanged = { caption ->
-                if (readAloud.isActive()) contentView.text = caption
+                if (readAloud.isActive()) {
+                    contentView.text = caption
+                    followReading()
+                }
             },
             onGenerating = { generating, estimatedMs ->
                 if (generating) synthBanner.start(estimatedMs) else synthBanner.stop()
@@ -314,6 +325,7 @@ class DetailActivity : Activity() {
         scrollView.addView(contentContainer)
         outer.addView(scrollView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         scrollView.setOnScrollChangeListener { _, _, scrollY, _, _ -> updateSectionIndicator(scrollY) }
+        scrollView.setOnTouchListener { _, _ -> lastUserScrollMs = android.os.SystemClock.uptimeMillis(); false }
 
         titleView = TextView(this).apply {
             textSize = 19f
@@ -665,6 +677,36 @@ class DetailActivity : Activity() {
         }
         jumpHighlightRunnable = runnable
         mainHandler.postDelayed(runnable, 2500)
+    }
+
+    private var lastUserScrollMs = 0L
+
+    /** Title/date/overview views - hidden while the live caption (which
+     * repeats all three) is showing. */
+    private fun setHeaderVisible(visible: Boolean) {
+        val v = if (visible) View.VISIBLE else View.GONE
+        titleView.visibility = v
+        subtitleView.visibility = v
+        overviewView.visibility = if (visible && isDigest && rawOverview.isNotBlank()) View.VISIBLE else View.GONE
+    }
+
+    /** Keeps the word being read on screen: when it drifts outside the
+     * middle band of the viewport, scroll so it sits about a quarter of the
+     * way down. Backs off for a few seconds after the user last touched the
+     * scroll view so it never fights a manual scroll (the locate button
+     * still jumps back on demand). */
+    private fun followReading() {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastUserScrollMs < 6000) return
+        val offset = readAloud.currentReadingOffset() ?: return
+        val layout = contentView.layout ?: return
+        val line = layout.getLineForOffset(offset.coerceIn(0, contentView.text.length))
+        val y = contentView.top + layout.getLineTop(line)
+        val top = scrollView.scrollY
+        val h = scrollView.height
+        if (y < top + dp(60) || y > top + h - dp(140)) {
+            scrollView.smoothScrollTo(0, (y - h / 4).coerceAtLeast(0))
+        }
     }
 
     /** Scrolls to wherever read-aloud is currently at - asked for
