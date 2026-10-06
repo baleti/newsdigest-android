@@ -837,8 +837,11 @@ class DetailActivity : Activity() {
     // playback, minus the real link spans - only the plain characters
     // matter here, for indexing into it at a saved char offset.
     private fun readAloudPlainText(): String = if (isDigest) {
-        val combined = if (rawOverview.isNotBlank()) "$rawOverview\n\n$rawContent" else rawContent
+        val withOverview = if (rawOverview.isNotBlank()) "$rawOverview\n\n$rawContent" else rawContent
+        val combined = if (sourceTitle.isNotBlank()) "$sourceTitle\n\n$withOverview" else withOverview
         MarkdownRenderer.render(combined) {}.toString()
+    } else if (sourceTitle.isNotBlank()) {
+        "$sourceTitle\n\n$rawContent"
     } else {
         rawContent
     }

@@ -418,6 +418,11 @@ class ReadAloudController(
         context.startForegroundService(Intent(context, TtsPlaybackService::class.java))
         svc.startSession(title, reopenIntent)
         val resumeText = fullText.substring(clampedStart)
+        // Resuming mid-text skips the title that a normal read opens with;
+        // speak it first as a lead-in (reported 2026-10-06). Its caption
+        // sentence is found by the highlight lookup's from-0 fallback, and
+        // the cursor then carries on from there into the resume point.
+        val leadIn = if (clampedStart > 0 && title.isNotBlank() && fullText.startsWith(title)) "$title\n\n" else ""
         // Rough upfront guess of the REMAINING length (not the whole
         // article, when resuming) so the system media notification has an
         // end-time to show immediately, rather than only whatever's been
@@ -429,7 +434,7 @@ class ReadAloudController(
         val wordCount = resumeText.split(Regex("\\s+")).count { it.isNotBlank() }
         svc.setEstimatedDuration((wordCount / (160.0 / 60.0) * 1000).toLong())
         svc.setPlaybackSpeed(currentSpeed)
-        streamText(resumeText, svc)
+        streamText(leadIn + resumeText, svc)
     }
 
     /** One ClickableSpan per whitespace-delimited word across the WHOLE
