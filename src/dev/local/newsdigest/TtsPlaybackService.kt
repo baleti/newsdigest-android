@@ -127,6 +127,11 @@ class TtsPlaybackService : Service() {
     // any one Activity by design (foreground service + real notification),
     // so it's the only thing that reliably knows.
     @Volatile private var hasActiveSession = false
+    // True only when the last session ended by reading to the end (the
+    // play thread drained the queue), false when stopAll() ended it - lets
+    // the UI keep a resume position for a manual/notification Stop.
+    @Volatile var lastEndWasNatural = false
+        private set
     @Volatile private var stopRequested = false
     @Volatile private var idleSignaled = true
     // Distinguishes "nothing left to play right now because the network is
@@ -520,6 +525,7 @@ class TtsPlaybackService : Service() {
         setPlaying(false)
         sessionEnded = true
         hasActiveSession = false
+        lastEndWasNatural = false
         seekGeneration++
         synchronized(lock) {
             allSentences.clear()
@@ -579,6 +585,7 @@ class TtsPlaybackService : Service() {
                 if (sessionEnded && !idleSignaled) {
                     idleSignaled = true
                     hasActiveSession = false
+                    lastEndWasNatural = true
                     abandonAudioFocus() // reading finished on its own - hand focus back
                     val myGen = sessionGeneration
                     mainHandler.post { if (sessionGeneration == myGen) listener?.onQueueIdle() }

@@ -193,7 +193,12 @@ class DetailActivity : Activity() {
                     // whole text - safe to treat as "done, nothing left to
                     // resume" and clear any saved position outright.
                     mainHandler.removeCallbacks(positionSaveTick)
-                    ReadAloudPositionStore.clear(this, readAloudPositionKey)
+                    // Not on a manual Stop (player bar X, notification Stop)
+                    // or error: keep the saved position so Resume stays
+                    // offered, however long ago it was stopped.
+                    if (readAloud.endedNaturally) {
+                        ReadAloudPositionStore.clear(this, readAloudPositionKey)
+                    }
                     updateReadAloudButtons()
                     // Restore the rich static view whenever playback
                     // stops - whether the user stopped it or it finished
@@ -296,7 +301,12 @@ class DetailActivity : Activity() {
                     playerBar.setSpeed(speed)
                 }
             },
-            onStop = { readAloud.stop() },
+            onStop = {
+                readAloud.currentReadingOffset()?.let {
+                    ReadAloudPositionStore.set(this, readAloudPositionKey, it)
+                }
+                readAloud.stop()
+            },
             onLocate = { scrollToCurrentReading() },
             getPosition = { readAloud.getPositionMs() },
             getDuration = { readAloud.getDurationMs() },

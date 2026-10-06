@@ -239,11 +239,18 @@ class ReadAloudController(
                 onGenerating(false, 0L)
                 if (active) {
                     active = false
+                    endedNaturally = ttsService?.lastEndWasNatural ?: false
                     onStateChanged.invoke(false)
                 }
             }
         }
     }
+
+    /** True only if the last end-of-read was reaching the end of the text,
+     * not a Stop (in-app, notification) or an error - lets the screen
+     * keep the saved position for Resume in the latter cases. */
+    @Volatile var endedNaturally = false
+        private set
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -657,6 +664,7 @@ class ReadAloudController(
                             mainHandler.post {
                                 if (active) {
                                     active = false
+                                    endedNaturally = false
                                     onStateChanged.invoke(false)
                                 }
                             }
@@ -734,6 +742,7 @@ class ReadAloudController(
 
     fun stop() {
         active = false
+        endedNaturally = false
         onGenerating(false, 0L)
         streamGeneration++ // suppress any late callback from whatever stream this abandons
         ws?.close()
