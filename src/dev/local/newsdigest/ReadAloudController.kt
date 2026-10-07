@@ -320,7 +320,11 @@ class ReadAloudController(
      * current sentence. Null when not active. A caller uses this to
      * scroll its own view back to the live position on demand. */
     fun currentReadingOffset(): Int? =
-        if (!active) null else (currentHighlightStart ?: currentSentenceStartOffset)
+        // A controller that merely re-attached to a session some earlier screen instance started (see
+        // `connection.onServiceConnected`) is `active` but never received the text, so its offsets are
+        // just defaults (0). Reporting those made Resume start over: reopening the article after a pause
+        // saved offset 0 over the real position (reported 2026-10-07).
+        if (!active || fullText.isEmpty()) null else (currentHighlightStart ?: currentSentenceStartOffset)
 
     /** Current playback position in ms, for a scrubber to show/drive -
      * asked for explicitly 2026-09-10. Pass-through to the service so a
