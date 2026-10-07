@@ -2,7 +2,7 @@ package dev.local.newsdigest
 
 /**
  * Strips markdown formatting down to plain text -- ported from
- * dictate-android's own MarkdownStrip (same regex passes, same order;
+ * digital-assistant-android's own MarkdownStrip (same regex passes, same order;
  * that one migrated the old Termux .shortcuts/md-clip-plain script,
  * this is just a second copy for DetailActivity's own "copy article as
  * plain text" long-press action, asked for explicitly 2026-09-20).
