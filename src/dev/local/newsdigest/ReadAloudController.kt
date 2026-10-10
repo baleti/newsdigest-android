@@ -624,6 +624,30 @@ class ReadAloudController(
             }.apply { isDaemon = true; name = "ReadAloudLocalTts"; start() }
         }
 
+        // Mid-stream fallback: once the server has taken over the first local thread is gone. If the
+        // server then falls behind (buffer nearly spent while playing), speak the next sentence
+        // on-device instead of stalling; server sentences local covered are dropped by the localEnd
+        // check above, and the server resumes as soon as it lands one past that.
+        if (local != null && localSentences.isNotEmpty()) {
+            Thread {
+                while (isCurrent()) {
+                    Thread.sleep(150)
+                    if (!serverTookOver || !svc.isPlaying() || svc.bufferedAheadMs() > 400) continue
+                    val from = synchronized(feedLock) { maxOf(serverCursor, localEnd) }
+                    val range = localSentences.firstOrNull { it.last + 1 > from } ?: continue
+                    val sentence = text.substring(range)
+                    val audio = local.synthesize(speakableForLocalTts(sentence)) ?: continue
+                    synchronized(feedLock) {
+                        if (!isCurrent() || maxOf(serverCursor, localEnd) >= range.last + 1) return@synchronized
+                        Log.w("ReadAloudController", "server behind, local fallback for sentence at ${range.first}")
+                        localSpoken.add(sentence)
+                        svc.enqueueSentence(sentence, estimateWordTimings(sentence, audio), audio.pcm, audio.sampleRate)
+                        localEnd = range.last + 1
+                    }
+                }
+            }.apply { isDaemon = true; name = "ReadAloudLocalFallback"; start() }
+        }
+
         wsThread = Thread {
             val client = WebSocketClient(
                 Settings.getHost(context),
