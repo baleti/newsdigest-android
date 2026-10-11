@@ -651,6 +651,56 @@ class ReadAloudController(
             }.apply { isDaemon = true; name = "ReadAloudLocalFallback"; start() }
         }
 
+        // Rescue: if the Chatterbox stream fails for ANY reason once it had taken over (or local never
+        // started), show an error and let on-device TTS read everything the server did not deliver.
+        // Playback must never just stop.
+        val allSentences = splitLocalSentences(text)
+        val rescueStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val fallbackNotified = java.util.concurrent.atomic.AtomicBoolean(false)
+        var doneReceived = false
+        fun notifyFallback(why: String) {
+            if (!fallbackNotified.compareAndSet(false, true)) return
+            mainHandler.post {
+                android.widget.Toast.makeText(context, "Chatterbox unavailable ($why) - using on-device voice", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+        fun startRescue(why: String) {
+            if (doneReceived || !isCurrent()) return
+            notifyFallback(why)
+            if (!(serverTookOver || localSentences.isEmpty())) return // the first local thread still covers it
+            if (!rescueStarted.compareAndSet(false, true)) return
+            Log.w("ReadAloudController", "server stream failed ($why): on-device TTS takes over")
+            Thread {
+                var skippedTo = 0
+                try {
+                    var waited = 0
+                    while (isCurrent() && waited < 15000 && localTts?.isReady() != true) {
+                        if (localTts == null) localTts = try { LocalTts(context) } catch (e: Exception) { null }
+                        Thread.sleep(250); waited += 250
+                    }
+                    val engine = localTts?.takeIf { it.isReady() }
+                    if (engine == null) { Log.e("ReadAloudController", "rescue: no on-device TTS available"); return@Thread }
+                    while (isCurrent()) {
+                        val from = synchronized(feedLock) { maxOf(serverCursor, localEnd, skippedTo) }
+                        val range = allSentences.firstOrNull { it.last + 1 > from } ?: break
+                        while (isCurrent() && svc.bufferedAheadMs() > 700) Thread.sleep(100)
+                        val sentence = text.substring(range)
+                        val audio = engine.synthesize(speakableForLocalTts(sentence))
+                            ?: engine.synthesize(speakableForLocalTts(sentence))
+                        if (audio == null) { skippedTo = range.last + 1; continue }
+                        synchronized(feedLock) {
+                            if (!isCurrent()) return@synchronized
+                            localSpoken.add(sentence)
+                            svc.enqueueSentence(sentence, estimateWordTimings(sentence, audio), audio.pcm, audio.sampleRate)
+                            localEnd = range.last + 1
+                        }
+                    }
+                } finally {
+                    synchronized(feedLock) { if (isCurrent()) svc.endSession() }
+                }
+            }.apply { isDaemon = true; name = "ReadAloudRescue"; start() }
+        }
+
         wsThread = Thread {
             val client = WebSocketClient(
                 Settings.getHost(context),
@@ -682,6 +732,7 @@ class ReadAloudController(
                             mainHandler.post { onStatus(m, k, n) }
                         }
                         "done" -> {
+                            doneReceived = true
                             // No more sentences are coming, but whatever's
                             // already queued may still be playing - let
                             // TtsPlaybackService's own queue-drain decide
@@ -694,16 +745,9 @@ class ReadAloudController(
                         }
                         "error" -> {
                             Log.e("ReadAloudController", "server error: ${obj.optString("message")}")
-                            // Local TTS keeps reading on its own if it's running
-                            if (localSentences.isNotEmpty() && !serverTookOver) { serverFailed = true; return }
-                            svc.endSession()
-                            mainHandler.post {
-                                if (active) {
-                                    active = false
-                                    endedNaturally = false
-                                    onStateChanged.invoke(false)
-                                }
-                            }
+                            serverFailed = true
+                            notifyFallback(obj.optString("message").take(60))
+                            startRescue("error")
                         }
                     }
                 }
@@ -731,16 +775,17 @@ class ReadAloudController(
                     recordSynthMs(meta.optLong("synth_ms", -1))
                 }
 
+                override fun onClosed() { if (isCurrent()) startRescue("socket closed") }
+
                 override fun onFailure(error: Throwable) {
                     if (!isCurrent()) return // expected: skipAheadTo()'s ws.close() surfaces as a failure on the abandoned stream
                     Log.e("ReadAloudController", "websocket failed", error)
-                    if (localSentences.isNotEmpty() && !serverTookOver) { serverFailed = true; return } // local carries on
-                    mainHandler.post {
-                        active = false
-                        onStateChanged.invoke(false)
-                    }
+                    serverFailed = true
+                    notifyFallback(error.message?.take(60) ?: "connection failed")
+                    startRescue("websocket failure")
                 }
             })
+            startRescue("connection ended") // no-op after a normal "done"
         }.apply { isDaemon = true; name = "ReadAloudWs"; start() }
     }
 
