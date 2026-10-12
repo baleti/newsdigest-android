@@ -181,7 +181,7 @@ class SettingsActivity : Activity() {
         root.addView(sectionLabel("Claude account for chat"))
         root.addView(spacer(6))
         val accountField = EditText(this).apply {
-            hint = "account (claude / claude2 / claude3)"
+            hint = "account (claude / claude2 / claude3 / claude4)"
             setText(Settings.getAccount(this@SettingsActivity))
             Theme.styleEditText(this, this@SettingsActivity)
         }

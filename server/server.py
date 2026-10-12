@@ -54,7 +54,7 @@ import feed
 # reimplementing the same tmux-spawn/poll machinery a second time.
 CLAUDE_AGENTS_URL = os.environ.get("NEWSDIGEST_CLAUDE_AGENTS_URL", "http://127.0.0.1:8790")
 CLAUDE_AGENTS_TOKEN_FILE = Path.home() / ".config" / "claude-agents" / "token"
-ALLOWED_AGENT_ACCOUNTS = {"claude", "claude2", "claude3"}
+ALLOWED_AGENT_ACCOUNTS = {"claude", "claude2", "claude3", "claude4"}
 
 
 def _env_or_fatal(name):
