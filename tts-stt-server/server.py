@@ -793,10 +793,69 @@ def voices(engine: str = "kokoro"):
 # more than 2 sentences deep regardless of this constant.
 TTS_LOOKAHEAD_CAP_MS = 30_000
 TTS_MAX_CONCURRENT_SYNTHESIS = 2
-_tts_synthesis_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT_SYNTHESIS)
+
+
+class _StreamPrio:
+    """Per-/tts/stream scheduling state for _PriorityGate. `activity` is when the
+    stream was opened, or when its client first reported playback position
+    (i.e. the moment it became the section actually being listened to)."""
+
+    def __init__(self):
+        self.activity = time.monotonic()
+        self.playing = False
+
+    def mark_playing(self):
+        if not self.playing:
+            self.playing = True
+            self.activity = time.monotonic()
+
+
+class _PriorityGate:
+    """Drop-in for asyncio.Semaphore(n) on the synthesis path, but waiters are
+    granted most-recent-first instead of FIFO: a read the user just started
+    must not sit behind an older backlog (other apps' reads, abandoned
+    look-ahead). Order, evaluated when a slot frees (not when queued):
+    streams whose client is already playing them (has sent a position
+    report) before pure prefetch streams, then newest stream first, then
+    lowest sentence index within a stream."""
+
+    def __init__(self, n: int):
+        self._free = n
+        self._waiters: list[tuple[_StreamPrio, int, asyncio.Future]] = []
+
+    def locked(self) -> bool:
+        return self._free <= 0
+
+    async def acquire(self, prio: _StreamPrio, idx: int) -> None:
+        if self._free > 0:
+            self._free -= 1
+            return
+        fut = asyncio.get_running_loop().create_future()
+        entry = (prio, idx, fut)
+        self._waiters.append(entry)
+        try:
+            await fut
+        except BaseException:
+            if entry in self._waiters:
+                self._waiters.remove(entry)
+            elif fut.done() and not fut.cancelled():
+                self.release()  # granted just as we were cancelled: pass the slot on
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            best = min(self._waiters, key=lambda w: (not w[0].playing, -w[0].activity, w[1]))
+            self._waiters.remove(best)
+            if not best[2].done():
+                best[2].set_result(None)
+                return
+        self._free += 1
+
+
+_tts_synthesis_semaphore = _PriorityGate(TTS_MAX_CONCURRENT_SYNTHESIS)
 # Kokoro is CPU/onnx, Chatterbox is GPU - a backlog of Chatterbox work must
 # never make a Kokoro request wait, so Kokoro gets its own gate.
-_kokoro_synthesis_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT_SYNTHESIS)
+_kokoro_synthesis_semaphore = _PriorityGate(TTS_MAX_CONCURRENT_SYNTHESIS)
 
 
 def _estimate_sentence_ms(sentence: str) -> float:
@@ -839,6 +898,7 @@ async def tts_stream(websocket: WebSocket):
 
         played_ms = {"value": None}
         disconnected = asyncio.Event()
+        prio = _StreamPrio()
 
         async def receive_position_updates():
             try:
@@ -848,6 +908,7 @@ async def tts_stream(websocket: WebSocket):
                         v = msg.get("played_ms")
                         if isinstance(v, (int, float)) and v >= 0:
                             played_ms["value"] = v
+                            prio.mark_playing()
             except WebSocketDisconnect:
                 pass
             finally:
@@ -959,7 +1020,7 @@ async def tts_stream(websocket: WebSocket):
                     next_to_start += 1
                     pending_estimate_ms += _estimate_sentence_ms(sentences[idx])
                     pending[idx] = asyncio.create_task(
-                        _synthesize_sentence(engine, engine_name, sentences[idx], voice, make_emit(idx, n))
+                        _synthesize_sentence(engine, engine_name, sentences[idx], voice, make_emit(idx, n), prio, idx)
                     )
 
             fill_pipeline()
@@ -1018,7 +1079,7 @@ async def tts_stream(websocket: WebSocket):
             pass
 
 
-async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: str | None, emit=None) -> tuple[bytes, dict]:
+async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: str | None, emit=None, prio: _StreamPrio | None = None, idx: int = 0) -> tuple[bytes, dict]:
     """Just the synthesis half - no websocket I/O - so tts_stream can run
     several of these as concurrent tasks and send the results in order
     once ready. A cache hit intentionally skips the semaphore below (it's
@@ -1041,7 +1102,8 @@ async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: s
         _progress_sink.set(emit)
         if sem.locked():
             emit("Queued behind other sentences already being synthesized")
-    async with sem:
+    await sem.acquire(prio or _StreamPrio(), idx)
+    try:
         t0 = time.monotonic()
         samples, sr = await run_in_threadpool(engine.synthesize, expanded, voice)
         duration_s = len(samples) / sr
@@ -1052,6 +1114,8 @@ async def _synthesize_sentence(engine, engine_name: str, sentence: str, voice: s
             "text": sentence, "sample_rate": sr,
             "duration_ms": duration_ms, "synth_ms": round((time.monotonic() - t0) * 1000),
         }
+    finally:
+        sem.release()
 
 
 async def _send_sentence(websocket: WebSocket, pcm: bytes, meta: dict) -> int:
