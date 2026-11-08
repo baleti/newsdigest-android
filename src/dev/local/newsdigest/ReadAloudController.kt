@@ -593,6 +593,7 @@ class ReadAloudController(
         // arrive for text local already covered are dropped.
         val feedLock = Any()
         var serverTookOver = false
+        var serverGotAny = false // server audio has arrived: stop over-buffering local
         var localEnd = 0 // char offset into `text` that local audio has covered
         val local = localTts?.takeIf { it.isReady() }
         val localSentences = if (local != null) splitLocalSentences(text) else emptyList()
@@ -608,7 +609,7 @@ class ReadAloudController(
                     if (!isCurrent() || serverTookOver) return@Thread
                     // First sentence immediately; later ones only when the
                     // already-queued audio is nearly spent.
-                    while (i > 0 && isCurrent() && !serverTookOver && svc.bufferedAheadMs() > 700) Thread.sleep(100)
+                    while (i > 0 && isCurrent() && !serverTookOver && svc.bufferedAheadMs() > (if (serverGotAny) 1500L else 8_000L)) Thread.sleep(100)
                     if (!isCurrent() || serverTookOver) return@Thread
                     val sentence = text.substring(range)
                     val audio = local.synthesize(speakableForLocalTts(sentence))
@@ -635,7 +636,7 @@ class ReadAloudController(
             Thread {
                 while (isCurrent()) {
                     Thread.sleep(150)
-                    if (!serverTookOver || !svc.isPlaying() || svc.bufferedAheadMs() > 400) continue
+                    if (!serverTookOver || !svc.isPlaying() || svc.bufferedAheadMs() > 2500) continue
                     val from = synchronized(feedLock) { maxOf(serverCursor, localEnd) }
                     val range = localSentences.firstOrNull { it.last + 1 > from } ?: continue
                     val sentence = text.substring(range)
@@ -683,7 +684,7 @@ class ReadAloudController(
                     while (isCurrent()) {
                         val from = synchronized(feedLock) { maxOf(serverCursor, localEnd, skippedTo) }
                         val range = allSentences.firstOrNull { it.last + 1 > from } ?: break
-                        while (isCurrent() && svc.bufferedAheadMs() > 700) Thread.sleep(100)
+                        while (isCurrent() && svc.bufferedAheadMs() > 20_000L) Thread.sleep(100)
                         val sentence = text.substring(range)
                         val audio = engine.synthesize(speakableForLocalTts(sentence))
                             ?: engine.synthesize(speakableForLocalTts(sentence))
@@ -765,10 +766,19 @@ class ReadAloudController(
                     }
                     val sText = meta.getString("text")
                     synchronized(feedLock) {
-                        val idx = text.indexOf(sText, serverCursor)
-                        if (idx >= 0) serverCursor = idx + sText.length
-                        // Local already spoke this one - drop the server's copy.
-                        if (idx >= 0 && idx + sText.length <= localEnd) return
+                        serverGotAny = true
+                        // Locate the sentence in the source text; the server may normalise it, so fall back to its head,
+                        // then to "right after the cursor". Unlocatable sentences used to be spoken twice.
+                        val trimmed = sText.trim()
+                        var at = text.indexOf(sText, serverCursor)
+                        var len = sText.length
+                        if (at < 0) { at = text.indexOf(trimmed, serverCursor); len = trimmed.length }
+                        if (at < 0 && trimmed.length > 12) { at = text.indexOf(trimmed.take(12), serverCursor); len = trimmed.length }
+                        if (at < 0) { at = serverCursor; len = trimmed.length }
+                        serverCursor = maxOf(serverCursor, at + len)
+                        // Local covers everything before localEnd: drop any server sentence STARTING before it
+                        // (a straddling one included) - a repeat is worse than a missing half-sentence.
+                        if (at < localEnd) return
                         serverTookOver = true
                         svc.enqueueSentence(sText, words, data, meta.getInt("sample_rate"))
                     }
