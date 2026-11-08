@@ -45,6 +45,13 @@ object Settings {
 
     fun getHost(context: Context): String = prefs(context).getString("host", "") ?: ""
 
+    // TTS/STT streaming goes straight to the ai1 server on host1 (WireGuard hub 10.10.0.6:8100); the host/port
+    // above stay host3 for the digest + agent-chat API (ApiClient).
+    const val TTS_DIRECT_HOST = "10.10.0.6"
+    const val TTS_DIRECT_PORT = 8100
+    fun getTtsDirectHost(@Suppress("UNUSED_PARAMETER") context: Context): String = TTS_DIRECT_HOST
+    fun getTtsDirectPort(@Suppress("UNUSED_PARAMETER") context: Context): Int = TTS_DIRECT_PORT
+
     fun getTtsPort(context: Context): Int = prefs(context).getInt("tts_port", DEFAULT_TTS_PORT)
 
     fun getTtsEngine(context: Context): String = prefs(context).getString("engine", DEFAULT_ENGINE) ?: DEFAULT_ENGINE

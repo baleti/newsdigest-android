@@ -1034,7 +1034,7 @@ class DetailActivity : Activity() {
         startForegroundService(Intent(this, TtsPlaybackService::class.java))
         svc.startSession(sourceTitle)
         Thread {
-            val ws = WebSocketClient(Settings.getHost(this), Settings.getTtsPort(this), "/tts/stream", mapOf("X-Peer-Agent" to "1"))
+            val ws = WebSocketClient(Settings.getTtsDirectHost(this), Settings.getTtsDirectPort(this), "/tts/stream", mapOf("X-Peer-Agent" to "1"))
             ws.connect(
                 object : WebSocketClient.Listener {
                     private var pendingMeta: JSONObject? = null

@@ -704,8 +704,8 @@ class ReadAloudController(
 
         wsThread = Thread {
             val client = WebSocketClient(
-                Settings.getHost(context),
-                Settings.getTtsPort(context),
+                Settings.getTtsDirectHost(context),
+                Settings.getTtsDirectPort(context),
                 "/tts/stream",
                 mapOf("X-Peer-Agent" to "1"),
             )
