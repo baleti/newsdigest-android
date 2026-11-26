@@ -39,6 +39,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 from acronyms import expand_acronyms, expand_domains
+from stt_live import register_stt_live
 from text_clean import markdown_to_speech
 
 
@@ -52,7 +53,7 @@ def _env_or_fatal(name):
 
 BIND_HOST = _env_or_fatal("TTS_STT_BIND_HOST")
 BIND_PORT = int(os.environ.get("TTS_STT_BIND_PORT", "8100"))
-ALLOWED_SUBNET = ipaddress.ip_network(_env_or_fatal("TTS_STT_ALLOWED_SUBNET"))
+ALLOWED_SUBNETS = [ipaddress.ip_network(x.strip()) for x in _env_or_fatal("TTS_STT_ALLOWED_SUBNET").split(",") if x.strip()]  # comma-separated
 MODEL_DIR = Path.home() / ".cache" / "ai1-tts-stt-server"
 
 
@@ -80,7 +81,7 @@ def _source_allowed(client_host: str | None) -> bool:
         addr = ipaddress.ip_address(client_host)
     except ValueError:
         return False
-    return addr.is_loopback or addr in ALLOWED_SUBNET
+    return addr.is_loopback or any(addr in n for n in ALLOWED_SUBNETS)
 
 
 def _security_ok(client_host: str | None, headers) -> bool:
@@ -319,7 +320,11 @@ class ChatterboxEngine:
     def load(self):
         import torch  # noqa: F401 - import here, not at module scope, so a CUDA hiccup can't block Kokoro from serving
         from chatterbox.tts import ChatterboxTTS
-        self._model = ChatterboxTTS.from_pretrained(device=self.device)
+        # host1 migration 2026-10-30: from_pretrained() insists on conds.pt (a torch pickle, blocked by the model policy);
+        # this server always calls prepare_conditionals() with its own voice library right after load, so the built-in default voice is unused.
+        from huggingface_hub import snapshot_download
+        _ckpt = snapshot_download(repo_id="ResembleAI/chatterbox", allow_patterns=["*.safetensors", "*.json", "*.txt"], local_files_only=True)
+        self._model = ChatterboxTTS.from_local(_ckpt, self.device)
         self._prepared_voice_index = None
         self.ready = True
         self._apply_todays_voice_locked()
@@ -525,6 +530,34 @@ STT_MAX_BYTES = 16_000 * 2 * 60 * 15  # 16kHz, 16-bit mono, 15 minutes - not rem
 # cap is cheap insurance against an oversized body wedging memory if that gate were ever bypassed by a bug.
 
 
+STT_RECENT_DIR = "/ai1/models/tts-stt-cache/stt-recent"
+STT_RECENT_KEEP = 0  # 0 = keep everything
+
+
+def _keep_recent_stt(samples, text: str) -> None:
+    """Keep dictations (wav + transcript) so a wrong or lost result can be
+    replayed. Never lets a failure here break transcription."""
+    try:
+        import wave
+        os.makedirs(STT_RECENT_DIR, mode=0o700, exist_ok=True)
+        base = os.path.join(STT_RECENT_DIR, time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1000000:06d}")
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(base + ".wav", "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm.tobytes())
+        with open(base + ".txt", "w") as fh:
+            fh.write(text + "\n")
+        for old in sorted(n for n in os.listdir(STT_RECENT_DIR) if n.endswith(".wav"))[:-STT_RECENT_KEEP] if STT_RECENT_KEEP else []:
+            for ext in (".wav", ".txt"):
+                path = os.path.join(STT_RECENT_DIR, old[:-4] + ext)
+                if os.path.exists(path):
+                    os.remove(path)
+    except Exception as e:
+        print(f"[ai1-tts-stt-server] could not keep recent STT audio: {e}")
+
+
 class WhisperEngine:
     # device_index matters here specifically because this VM has TWO
     # GPUs (confirmed live 2026-09-20 while chasing "is there anything
@@ -567,12 +600,24 @@ class WhisperEngine:
 
     def transcribe(self, samples: np.ndarray) -> str:
         with self._lock:
-            segments, _info = self._model.transcribe(samples, language="en", beam_size=1)
+            segments, _info = self._model.transcribe(samples, language="en", beam_size=5)
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+        _keep_recent_stt(samples, text)
+        return text
+
+    def transcribe_live(self, samples: np.ndarray, beam_size: int) -> str:
+        with self._lock:
+            # beam 1 = throwaway partial pass: drop silence and don't let one
+            # guess feed the next, both of which curb invented text.
+            quick = beam_size == 1
+            segments, _info = self._model.transcribe(
+                samples, language="en", beam_size=beam_size,
+                vad_filter=quick, condition_on_previous_text=not quick)
             return " ".join(seg.text.strip() for seg in segments).strip()
 
     def transcribe_streaming(self, samples: np.ndarray, on_segment) -> None:
         with self._lock:
-            segments, _info = self._model.transcribe(samples, language="en", beam_size=1)
+            segments, _info = self._model.transcribe(samples, language="en", beam_size=5)
             for seg in segments:
                 on_segment(seg)
 
@@ -599,6 +644,12 @@ class SlotWhisperProxy:
             if not self._inner.ready:
                 self._inner.load()
             return self._inner.transcribe(samples)
+
+    def transcribe_live(self, samples: np.ndarray, beam_size: int) -> str:
+        with self._slot.use():
+            if not self._inner.ready:
+                self._inner.load()
+            return self._inner.transcribe_live(samples, beam_size)
 
     def transcribe_streaming(self, samples: np.ndarray, on_segment) -> None:
         with self._slot.use():
@@ -630,7 +681,11 @@ class SlotWhisperProxy:
 # rather than loaded unconditionally: a second Chatterbox instance and
 # ai1's separate image-gen process also want this card now, so this model
 # gets evicted/reloaded on demand instead of staying permanently resident.
-_whisper_medium_gpu = WhisperEngine("whisper-medium-gpu", "medium", "cuda", "int8", device_index=1)
+# 2026-11-26: now runs large-v3-turbo (medium was giving badly wrong dictation). The
+# "whisper-medium-gpu" id is kept because the phone app and desktop script send it.
+_whisper_medium_gpu = WhisperEngine(
+    "whisper-medium-gpu", "/ai1/models/tts-stt-cache/faster-whisper-large-v3-turbo",
+    "cuda", "int8", device_index=1)
 _whisper_gpu1_slot = RemoteGpuModel(
     "gpu1", "whisper-medium-gpu",
     f"http://127.0.0.1:{BIND_PORT}/internal/gpu/evict/whisper-medium-gpu",
@@ -771,6 +826,9 @@ async def stt_stream(websocket: WebSocket):
                 break
     except WebSocketDisconnect:
         pass
+
+
+register_stt_live(app, STT_ENGINES, _security_ok, STT_MAX_BYTES)
 
 
 @app.get("/voices")
